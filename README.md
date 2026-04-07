@@ -24,4 +24,4 @@ To demystify containerization by building a functional container runtime from sc
 ### Definition of Done
 The project is complete when the following command:
 `go run main.go run /bin/sh`
-Drops the user into a shell where `hostname` returns "airlock-container", `ps` shows only PID 1 and 2, and the filesystem root `/` contains only Alpine Linux files.# airlock
+Drops the user into a shell where `hostname` returns "airlock-container", `ps` shows only PID 1 and 2, and the filesystem root `/` contains only Alpine Linux files.
