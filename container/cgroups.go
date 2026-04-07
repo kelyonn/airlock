@@ -12,53 +12,86 @@ import (
 
 const cgroupRoot = "/sys/fs/cgroup"
 
-// SetupCgroups creates a cgroup for the container and applies resource limits.
+// SetupCgroups applies resource limits using cgroups v2.
+// It first tries to create a child cgroup. If that fails (e.g., inside Docker
+// where we're already in a leaf cgroup), it writes limits directly to the
+// current cgroup.
 // Returns a cleanup function to remove the cgroup when the container exits.
 func SetupCgroups(memoryLimit string, cpuPercent int) (func(), error) {
 	pid := os.Getpid()
-	cgroupName := fmt.Sprintf("airlock-%d", pid)
-	cgroupPath := filepath.Join(cgroupRoot, cgroupName)
 
-	// Create cgroup directory
-	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
-		return nil, fmt.Errorf("cannot create cgroup: %w", err)
-	}
-
-	cleanup := func() {
-		// Remove the container PID from the cgroup first
-		os.WriteFile(filepath.Join(cgroupRoot, "cgroup.procs"), []byte(fmt.Sprintf("%d", pid)), 0644)
-		// Remove the cgroup directory
-		os.Remove(cgroupPath)
-	}
-
-	// Set memory limit
 	memBytes, err := parseMemoryLimit(memoryLimit)
 	if err != nil {
-		cleanup()
 		return nil, fmt.Errorf("invalid memory limit: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(cgroupPath, "memory.max"), []byte(fmt.Sprintf("%d", memBytes)), 0644); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("cannot set memory limit: %w", err)
-	}
 
-	// Set CPU limit (using cpu.max with period of 100000 microseconds)
-	if cpuPercent > 0 && cpuPercent <= 100 {
-		quota := cpuPercent * 1000 // microseconds out of 100000
-		cpuMax := fmt.Sprintf("%d 100000", quota)
-		if err := os.WriteFile(filepath.Join(cgroupPath, "cpu.max"), []byte(cpuMax), 0644); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("cannot set CPU limit: %w", err)
+	// Try to create a child cgroup first (the "proper" way)
+	cgroupPath, useChild := tryCreateChildCgroup(pid)
+
+	cleanup := func() {
+		if useChild {
+			// Move process back to parent and remove child cgroup
+			os.WriteFile(filepath.Join(cgroupRoot, "cgroup.procs"), []byte(fmt.Sprintf("%d", pid)), 0644)
+			os.Remove(cgroupPath)
 		}
 	}
 
-	// Add current process to the cgroup
-	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("cannot add process to cgroup: %w", err)
+	// Apply memory limit
+	memFile := filepath.Join(cgroupPath, "memory.max")
+	if err := os.WriteFile(memFile, []byte(fmt.Sprintf("%d", memBytes)), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "info: memory limit not applied: %v\n", err)
+	} else {
+		fmt.Printf("   Memory limit: %s\n", memoryLimit)
+	}
+
+	// Apply CPU limit (quota/period in microseconds)
+	if cpuPercent > 0 && cpuPercent <= 100 {
+		quota := cpuPercent * 1000 // out of 100000 period
+		cpuMax := fmt.Sprintf("%d 100000", quota)
+		cpuFile := filepath.Join(cgroupPath, "cpu.max")
+		if err := os.WriteFile(cpuFile, []byte(cpuMax), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "info: CPU limit not applied: %v\n", err)
+		} else {
+			fmt.Printf("   CPU limit: %d%%\n", cpuPercent)
+		}
+	}
+
+	// If using a child cgroup, move this process into it
+	if useChild {
+		procsFile := filepath.Join(cgroupPath, "cgroup.procs")
+		if err := os.WriteFile(procsFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("cannot add process to cgroup: %w", err)
+		}
 	}
 
 	return cleanup, nil
+}
+
+// tryCreateChildCgroup attempts to create a child cgroup under the root.
+// Returns (cgroupPath, true) if successful, or (cgroupRoot, false) if we
+// should write directly to the current cgroup (e.g., inside Docker).
+func tryCreateChildCgroup(pid int) (string, bool) {
+	// Enable controller delegation
+	subtreeControl := filepath.Join(cgroupRoot, "cgroup.subtree_control")
+	os.WriteFile(subtreeControl, []byte("+memory +cpu"), 0644)
+
+	cgroupName := fmt.Sprintf("airlock-%d", pid)
+	cgroupPath := filepath.Join(cgroupRoot, cgroupName)
+
+	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
+		// Can't create child cgroup — write limits to current cgroup directly
+		return cgroupRoot, false
+	}
+
+	// Check if memory.max exists in the child (controllers delegated properly)
+	if _, err := os.Stat(filepath.Join(cgroupPath, "memory.max")); err != nil {
+		// Controllers not delegated — clean up and fall back
+		os.Remove(cgroupPath)
+		return cgroupRoot, false
+	}
+
+	return cgroupPath, true
 }
 
 // parseMemoryLimit converts a human-readable memory limit to bytes.

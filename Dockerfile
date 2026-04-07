@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine
+FROM golang:1.25-alpine
 
 # Install useful tools for debugging inside containers
 RUN apk add --no-cache bash strace util-linux
