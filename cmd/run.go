@@ -45,5 +45,8 @@ func init() {
 	runCmd.Flags().StringVarP(&memoryLimit, "memory", "m", "100m", "memory limit (e.g., 100m, 1g)")
 	runCmd.Flags().IntVar(&cpuLimit, "cpu", 50, "CPU limit as percentage (1-100)")
 	runCmd.Flags().StringVar(&hostname, "hostname", "airlock-container", "container hostname")
+	// Stop flag parsing after the first positional arg (the container command).
+	// Without this, `airlock run /bin/sh -c "cmd"` would try to parse -c as an airlock flag.
+	runCmd.Flags().SetInterspersed(false)
 	rootCmd.AddCommand(runCmd)
 }
