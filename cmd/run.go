@@ -12,6 +12,7 @@ var (
 	memoryLimit string
 	cpuLimit    int
 	hostname    string
+	volumes     []string // raw -v specs e.g. "/tmp:/data:ro"
 )
 
 var runCmd = &cobra.Command{
@@ -25,6 +26,17 @@ Example:
   airlock run --memory 256m --cpu 80 /bin/sh`,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		// Parse each -v spec into a typed VolumeMount before running
+		var mounts []container.VolumeMount
+		for _, spec := range volumes {
+			mount, err := container.ParseVolumeSpec(spec)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid volume %q: %v\n", spec, err)
+				os.Exit(1)
+			}
+			mounts = append(mounts, mount)
+		}
+
 		config := container.Config{
 			Command:     args[0],
 			Args:        args[1:],
@@ -32,6 +44,7 @@ Example:
 			MemoryLimit: memoryLimit,
 			CPULimit:    cpuLimit,
 			Verbose:     verbose,
+			Volumes:     mounts,
 		}
 
 		if err := container.Run(config); err != nil {
@@ -45,6 +58,7 @@ func init() {
 	runCmd.Flags().StringVarP(&memoryLimit, "memory", "m", "100m", "memory limit (e.g., 100m, 1g)")
 	runCmd.Flags().IntVar(&cpuLimit, "cpu", 50, "CPU limit as percentage (1-100)")
 	runCmd.Flags().StringVar(&hostname, "hostname", "airlock-container", "container hostname")
+	runCmd.Flags().StringArrayVarP(&volumes, "volume", "v", nil, "bind mount a volume: host_path:container_path[:ro] (repeatable)")
 	// Stop flag parsing after the first positional arg (the container command).
 	// Without this, `airlock run /bin/sh -c "cmd"` would try to parse -c as an airlock flag.
 	runCmd.Flags().SetInterspersed(false)

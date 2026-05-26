@@ -3,6 +3,7 @@
 package container
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,9 +14,9 @@ import (
 
 // Child is called inside the new namespaces. It sets up chroot, mounts,
 // cgroups, hostname, and then execs the user's command.
-// Args: rootfsDir, hostname, memoryLimit, cpuLimit, command, [command args...]
+// Args: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON, command, [command args...]
 func Child(args []string) error {
-	if len(args) < 5 {
+	if len(args) < 6 {
 		return fmt.Errorf("insufficient arguments for child process")
 	}
 
@@ -23,8 +24,14 @@ func Child(args []string) error {
 	hostname := args[1]
 	memoryLimit := args[2]
 	cpuLimit, _ := strconv.Atoi(args[3])
-	command := args[4]
-	cmdArgs := args[5:]
+
+	var volumes []VolumeMount
+	if err := json.Unmarshal([]byte(args[4]), &volumes); err != nil {
+		return fmt.Errorf("failed to parse volume specs: %w", err)
+	}
+
+	command := args[5]
+	cmdArgs := args[6:]
 
 	// Step 1: Set hostname
 	if err := syscall.Sethostname([]byte(hostname)); err != nil {
@@ -43,17 +50,32 @@ func Child(args []string) error {
 		}
 	}()
 
-	// Step 3: Set up chroot with pivot_root
-	if err := setupChroot(rootfsDir); err != nil {
+	// Step 3: Bind-mount the rootfs to itself FIRST (makes it a mount point for pivot_root).
+	// We do NOT use MS_REC — that causes kernel lock contention when source == destination
+	// and submounts already exist.
+	if err := bindRootfsToSelf(rootfsDir); err != nil {
+		return fmt.Errorf("rootfs bind mount failed: %w", err)
+	}
+
+	// Step 4: Bind-mount volumes into the rootfs AFTER the bind mount but BEFORE pivot_root.
+	// At this point rootfsDir is its own mount point; volumes stack on top cleanly.
+	if len(volumes) > 0 {
+		if err := PrepareVolumeMounts(rootfsDir, volumes); err != nil {
+			return fmt.Errorf("volume mount failed: %w", err)
+		}
+	}
+
+	// Step 5: Complete the chroot by performing pivot_root
+	if err := completePivotRoot(rootfsDir); err != nil {
 		return fmt.Errorf("chroot setup failed: %w", err)
 	}
 
-	// Step 4: Mount /proc inside the container
+	// Step 6: Mount /proc inside the container
 	if err := mountProc(); err != nil {
 		return fmt.Errorf("failed to mount /proc: %w", err)
 	}
 
-	// Step 5: Execute the user's command
+	// Step 7: Execute the user's command
 	fmt.Printf("🔒 Entering container (hostname: %s)\n", hostname)
 	fmt.Println("   Type 'exit' to leave the container.\n")
 
@@ -72,13 +94,19 @@ func Child(args []string) error {
 	return syscall.Exec(binary, append([]string{command}, cmdArgs...), env)
 }
 
-// setupChroot sets up the root filesystem using chroot.
-func setupChroot(rootfsDir string) error {
-	// Mount the rootfs as a bind mount to itself (required for pivot_root)
-	if err := syscall.Mount(rootfsDir, rootfsDir, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+// bindRootfsToSelf bind-mounts rootfsDir onto itself, making it its own mount point.
+// This is required by pivot_root. We deliberately do NOT use MS_REC to avoid
+// kernel lock contention when source == destination and submounts already exist.
+func bindRootfsToSelf(rootfsDir string) error {
+	if err := syscall.Mount(rootfsDir, rootfsDir, "", syscall.MS_BIND, ""); err != nil {
 		return fmt.Errorf("bind mount failed: %w", err)
 	}
+	return nil
+}
 
+// completePivotRoot performs the pivot_root (or falls back to chroot) to make
+// rootfsDir the new root filesystem. Called after volumes are mounted.
+func completePivotRoot(rootfsDir string) error {
 	// Create the old_root directory for pivot_root
 	oldRoot := filepath.Join(rootfsDir, ".pivot_root")
 	if err := os.MkdirAll(oldRoot, 0700); err != nil {
@@ -87,7 +115,7 @@ func setupChroot(rootfsDir string) error {
 
 	// pivot_root swaps the root filesystem
 	if err := syscall.PivotRoot(rootfsDir, oldRoot); err != nil {
-		// Fall back to chroot if pivot_root fails
+		// Fall back to chroot if pivot_root fails (e.g., some Docker environments)
 		fmt.Fprintf(os.Stderr, "warning: pivot_root failed (%v), falling back to chroot\n", err)
 		if err := syscall.Chroot(rootfsDir); err != nil {
 			return fmt.Errorf("chroot failed: %w", err)

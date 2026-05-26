@@ -3,6 +3,7 @@
 package container
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,6 +27,14 @@ func Run(config Config) error {
 
 	if config.Verbose {
 		fmt.Printf("[container] rootfs: %s\n", rootfsDir)
+	}
+
+	// Step 1.5: Validate that all host volume paths exist before starting the child.
+	// Fail fast with a clear error rather than a cryptic mount failure.
+	for _, vol := range config.Volumes {
+		if _, err := os.Stat(vol.HostPath); err != nil {
+			return fmt.Errorf("volume host path does not exist: %s", vol.HostPath)
+		}
 	}
 
 	// Step 2: Re-execute ourselves with "child" as the first argument.
@@ -69,8 +78,11 @@ func Run(config Config) error {
 
 // reexecCommand builds an exec.Cmd that re-invokes the current binary
 // in "child" mode. We pass the config as command-line arguments.
+// Arg order: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON, command, [cmdArgs...]
 func reexecCommand(config Config, rootfsDir string) *exec.Cmd {
-	args := []string{"child", rootfsDir, config.Hostname, config.MemoryLimit, fmt.Sprintf("%d", config.CPULimit), config.Command}
+	volumesJSON, _ := json.Marshal(config.Volumes)
+
+	args := []string{"child", rootfsDir, config.Hostname, config.MemoryLimit, fmt.Sprintf("%d", config.CPULimit), string(volumesJSON), config.Command}
 	args = append(args, config.Args...)
 
 	cmd := exec.Command("/proc/self/exe", args...)
