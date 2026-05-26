@@ -13,6 +13,7 @@ var (
 	cpuLimit    int
 	hostname    string
 	volumes     []string // raw -v specs e.g. "/tmp:/data:ro"
+	noSeccomp   bool
 )
 
 var runCmd = &cobra.Command{
@@ -45,6 +46,7 @@ Example:
 			CPULimit:    cpuLimit,
 			Verbose:     verbose,
 			Volumes:     mounts,
+			NoSeccomp:   noSeccomp,
 		}
 
 		if err := container.Run(config); err != nil {
@@ -59,6 +61,7 @@ func init() {
 	runCmd.Flags().IntVar(&cpuLimit, "cpu", 50, "CPU limit as percentage (1-100)")
 	runCmd.Flags().StringVar(&hostname, "hostname", "airlock-container", "container hostname")
 	runCmd.Flags().StringArrayVarP(&volumes, "volume", "v", nil, "bind mount a volume: host_path:container_path[:ro] (repeatable)")
+	runCmd.Flags().BoolVar(&noSeccomp, "no-seccomp", false, "disable seccomp syscall filtering (for debugging)")
 	// Stop flag parsing after the first positional arg (the container command).
 	// Without this, `airlock run /bin/sh -c "cmd"` would try to parse -c as an airlock flag.
 	runCmd.Flags().SetInterspersed(false)

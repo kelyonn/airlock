@@ -20,4 +20,5 @@ type Config struct {
 	CPULimit    int
 	Verbose     bool
 	Volumes     []VolumeMount // bind-mounts to set up inside the container
+	NoSeccomp   bool          // if true, skip seccomp filter (for debugging)
 }

@@ -14,9 +14,9 @@ import (
 
 // Child is called inside the new namespaces. It sets up chroot, mounts,
 // cgroups, hostname, and then execs the user's command.
-// Args: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON, command, [command args...]
+// Args: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON, noSeccomp, command, [command args...]
 func Child(args []string) error {
-	if len(args) < 6 {
+	if len(args) < 7 {
 		return fmt.Errorf("insufficient arguments for child process")
 	}
 
@@ -29,9 +29,10 @@ func Child(args []string) error {
 	if err := json.Unmarshal([]byte(args[4]), &volumes); err != nil {
 		return fmt.Errorf("failed to parse volume specs: %w", err)
 	}
+	noSeccomp := args[5] == "true"
 
-	command := args[5]
-	cmdArgs := args[6:]
+	command := args[6]
+	cmdArgs := args[7:]
 
 	// Step 1: Set hostname
 	if err := syscall.Sethostname([]byte(hostname)); err != nil {
@@ -73,6 +74,18 @@ func Child(args []string) error {
 	// Step 6: Mount /proc inside the container
 	if err := mountProc(); err != nil {
 		return fmt.Errorf("failed to mount /proc: %w", err)
+	}
+
+	// Step 7: Install seccomp filter LAST — after all our own mounts are done.
+	// SYS_MOUNT is in the deny list, so applying seccomp before our mounts would
+	// break pivot_root and the proc/volume bind mounts.
+	if !noSeccomp {
+		if err := ApplySeccomp(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: seccomp filter failed: %v\n", err)
+			// Continue — seccomp failure is logged but not fatal
+		}
+	} else {
+		fmt.Println("   ⚠️  Seccomp disabled (--no-seccomp)")
 	}
 
 	// Step 7: Execute the user's command
@@ -138,6 +151,7 @@ func completePivotRoot(rootfsDir string) error {
 
 	return nil
 }
+
 
 // mountProc mounts the proc filesystem inside the container.
 func mountProc() error {

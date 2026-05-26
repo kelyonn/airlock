@@ -1,0 +1,144 @@
+//go:build linux
+
+package container
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+// Seccomp return values
+const (
+	seccompRetKill  = uint32(0x00000000) // kill the process
+	seccompRetEPERM = uint32(0x00050001) // return EPERM (errno=1) to the caller
+	seccompRetAllow = uint32(0x7fff0000) // allow the syscall
+)
+
+// auditArchX86_64 is the AUDIT_ARCH value for x86_64 (EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE)
+const auditArchX86_64 = uint32(0xc000003e)
+
+// Offsets into the seccomp_data struct passed to BPF programs by the kernel
+const (
+	seccompDataNrOffset   = uint32(0) // syscall number
+	seccompDataArchOffset = uint32(4) // architecture
+)
+
+// blockedSyscalls is the curated list of syscalls blocked inside airlock containers.
+var blockedSyscalls = []uint32{
+	unix.SYS_REBOOT,          // reboot the host
+	unix.SYS_KEXEC_LOAD,      // load a new kernel image
+	unix.SYS_SWAPON,          // enable a swap device
+	unix.SYS_SWAPOFF,         // disable a swap device
+	unix.SYS_MOUNT,           // remount host filesystems
+	unix.SYS_PIVOT_ROOT,      // escape the container root
+	unix.SYS_SETTIMEOFDAY,    // manipulate the host clock
+	unix.SYS_PERF_EVENT_OPEN, // open perf events (side-channel attacks)
+}
+
+// bpfStmt creates a no-jump BPF instruction.
+func bpfStmt(code uint16, k uint32) unix.SockFilter {
+	return unix.SockFilter{Code: code, K: k}
+}
+
+// bpfJump creates a conditional-jump BPF instruction.
+func bpfJump(code uint16, k uint32, jt, jf uint8) unix.SockFilter {
+	return unix.SockFilter{Code: code, Jt: jt, Jf: jf, K: k}
+}
+
+// seccompUnavailableMsg is printed when the environment doesn't support seccomp.
+const seccompUnavailableMsg = "   ⚠️  Seccomp: skipped (not supported in this kernel/environment)"
+
+// isLinuxtKitVM returns true when running inside Docker Desktop's linuxkit VM.
+//
+// In Docker Desktop (Mac/Windows), containers run inside a lightweight linuxkit
+// VM. This VM's kernel uses RCU synchronization internally when installing
+// seccomp filters (prctl(PR_SET_SECCOMP)), and because the VM typically has
+// a single vCPU in debug/dev mode, synchronize_rcu() can deadlock the entire
+// VM — freezing ALL goroutines in the process, including timers and signal
+// handlers. Detecting linuxkit allows us to skip the frozen-kernel path safely.
+//
+// On production Linux systems (bare metal, EC2, GCP, etc.) this returns false
+// and seccomp is installed normally.
+func isLinuxtKitVM() bool {
+	data, err := os.ReadFile("/proc/version")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(data)), "linuxkit")
+}
+
+// ApplySeccomp installs a pure-Go BPF seccomp filter that blocks a curated
+// set of dangerous syscalls from within the container.
+//
+// Environments where seccomp is not installed (returned early):
+//   - Docker Desktop / linuxkit VM: prctl(PR_SET_SECCOMP) triggers a kernel
+//     RCU synchronization deadlock on single-vCPU VMs. We detect linuxkit and
+//     skip gracefully rather than hanging indefinitely.
+//   - Any environment where PR_SET_NO_NEW_PRIVS or PR_SET_SECCOMP returns an
+//     error (e.g., some hardened CI that blocks nested seccomp) — we log a
+//     warning and continue.
+func ApplySeccomp() error {
+	// Environment-based fast-path: skip seccomp in known-deadlocking environments.
+	if isLinuxtKitVM() {
+		fmt.Fprintf(os.Stderr, "%s\n", seccompUnavailableMsg)
+		return nil
+	}
+
+	// Build the BPF program:
+	//   [0]  Load arch field from seccomp_data
+	//   [1]  If arch == x86_64: skip [2]; else fall through to [2]
+	//   [2]  KILL (wrong architecture — reject unknown arch binaries)
+	//   [3]  Load syscall number
+	//   [4…] Per-syscall: JEQ blockedNR → EPERM
+	//   [N]  Default: ALLOW
+	filter := []unix.SockFilter{
+		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataArchOffset),
+		bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, auditArchX86_64, 1, 0),
+		bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetKill),
+		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataNrOffset),
+	}
+	for _, nr := range blockedSyscalls {
+		filter = append(filter,
+			bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, nr, 0, 1),
+			bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetEPERM),
+		)
+	}
+	filter = append(filter, bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetAllow))
+
+	prog := unix.SockFprog{
+		Len:    uint16(len(filter)),
+		Filter: &filter[0],
+	}
+
+	// PR_SET_NO_NEW_PRIVS: required before installing a seccomp filter as a
+	// non-root process (or when the caller lacks CAP_SYS_ADMIN). It prevents
+	// execve'd children from gaining new privileges via setuid/setcap binaries.
+	// Once set it is irrevocable for this process and all its descendants.
+	if _, _, errno := unix.Syscall6(
+		unix.SYS_PRCTL,
+		38, // PR_SET_NO_NEW_PRIVS
+		1, 0, 0, 0, 0,
+	); errno != 0 {
+		return fmt.Errorf("PR_SET_NO_NEW_PRIVS: %w", errno)
+	}
+
+	// prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog): install the BPF filter
+	// on THIS THREAD. After syscall.Exec replaces the process image, the
+	// execve'd binary inherits the filter (the kernel carries it forward).
+	if _, _, errno := unix.Syscall6(
+		unix.SYS_PRCTL,
+		unix.PR_SET_SECCOMP,
+		unix.SECCOMP_MODE_FILTER,
+		uintptr(unsafe.Pointer(&prog)),
+		0, 0, 0,
+	); errno != 0 {
+		return fmt.Errorf("prctl(PR_SET_SECCOMP): %w", errno)
+	}
+
+	fmt.Printf("   🔐 Seccomp: blocking %d dangerous syscalls\n", len(blockedSyscalls))
+	return nil
+}

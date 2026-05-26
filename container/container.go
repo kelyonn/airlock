@@ -78,11 +78,15 @@ func Run(config Config) error {
 
 // reexecCommand builds an exec.Cmd that re-invokes the current binary
 // in "child" mode. We pass the config as command-line arguments.
-// Arg order: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON, command, [cmdArgs...]
+// Arg order: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON, noSeccomp, command, [cmdArgs...]
 func reexecCommand(config Config, rootfsDir string) *exec.Cmd {
 	volumesJSON, _ := json.Marshal(config.Volumes)
+	noSeccomp := "false"
+	if config.NoSeccomp {
+		noSeccomp = "true"
+	}
 
-	args := []string{"child", rootfsDir, config.Hostname, config.MemoryLimit, fmt.Sprintf("%d", config.CPULimit), string(volumesJSON), config.Command}
+	args := []string{"child", rootfsDir, config.Hostname, config.MemoryLimit, fmt.Sprintf("%d", config.CPULimit), string(volumesJSON), noSeccomp, config.Command}
 	args = append(args, config.Args...)
 
 	cmd := exec.Command("/proc/self/exe", args...)
