@@ -1,7 +1,8 @@
 FROM golang:1.25-alpine
 
-# Install useful tools for debugging inside containers
-RUN apk add --no-cache bash strace util-linux
+# Install tools needed for container runtime testing
+# iptables, iproute2 = networking; strace = syscall tracing; util-linux = pivot_root etc.
+RUN apk add --no-cache bash strace util-linux iptables iproute2 curl
 
 WORKDIR /app
 
