@@ -132,6 +132,8 @@ func extractTarGz(r io.Reader, dest string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
+			// Remove existing entry (symlink or file) before creating the new one.
+			os.Remove(target)
 			if err := os.Symlink(header.Linkname, target); err != nil {
 				return err
 			}
@@ -139,6 +141,8 @@ func extractTarGz(r io.Reader, dest string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
+			// Remove existing entry before hard-linking.
+			os.Remove(target)
 			linkTarget := filepath.Join(dest, header.Linkname)
 			if err := os.Link(linkTarget, target); err != nil {
 				return err

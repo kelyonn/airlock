@@ -5,13 +5,22 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/kelyonnnn17/airlock/image"
 	"github.com/spf13/cobra"
+)
+
+var (
+	cleanImages bool
+	cleanAll    bool
 )
 
 var cleanCmd = &cobra.Command{
 	Use:   "clean",
-	Short: "Remove cached rootfs and container data",
-	Long:  `Clean removes the cached Alpine rootfs and all container data from ~/.airlock/`,
+	Short: "Remove cached rootfs, images, and container data",
+	Long: `Clean removes cached data from ~/.airlock/.
+
+By default, only the Alpine rootfs cache and container state are removed.
+Use --images to also remove pulled OCI image layers, or --all to remove everything.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -21,20 +30,77 @@ var cleanCmd = &cobra.Command{
 
 		airlockDir := filepath.Join(home, ".airlock")
 
-		if _, err := os.Stat(airlockDir); os.IsNotExist(err) {
-			fmt.Println("Nothing to clean.")
+		// --all: wipe the entire ~/.airlock directory.
+		if cleanAll {
+			if _, err := os.Stat(airlockDir); os.IsNotExist(err) {
+				fmt.Println("Nothing to clean.")
+				return
+			}
+			if err := os.RemoveAll(airlockDir); err != nil {
+				fmt.Fprintf(os.Stderr, "error removing %s: %v\n", airlockDir, err)
+				os.Exit(1)
+			}
+			fmt.Println("✓ Cleaned up ~/.airlock/ (everything)")
 			return
 		}
 
-		if err := os.RemoveAll(airlockDir); err != nil {
-			fmt.Fprintf(os.Stderr, "error removing %s: %v\n", airlockDir, err)
-			os.Exit(1)
+		// --images (or default): selectively clean.
+		cleaned := false
+
+		// Clean OCI image and blob cache when --images is set.
+		if cleanImages {
+			freed, err := image.CleanImageCache()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error cleaning image cache: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("✓ Cleaned image cache (freed %s)\n", formatBytes(freed))
+			cleaned = true
 		}
 
-		fmt.Println("✓ Cleaned up ~/.airlock/")
+		// Always clean the Alpine rootfs cache and containers state.
+		rootfsDir := filepath.Join(airlockDir, "rootfs")
+		if _, err := os.Stat(rootfsDir); err == nil {
+			if err := os.RemoveAll(rootfsDir); err != nil {
+				fmt.Fprintf(os.Stderr, "error removing rootfs cache: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("✓ Cleaned Alpine rootfs cache")
+			cleaned = true
+		}
+
+		stateFile := filepath.Join(airlockDir, "containers.json")
+		if _, err := os.Stat(stateFile); err == nil {
+			if err := os.Remove(stateFile); err != nil {
+				fmt.Fprintf(os.Stderr, "error removing state file: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("✓ Cleaned container state")
+			cleaned = true
+		}
+
+		if !cleaned {
+			fmt.Println("Nothing to clean.")
+		}
 	},
 }
 
+// formatBytes converts a byte count into a human-readable string (KB, MB, GB).
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
 func init() {
+	cleanCmd.Flags().BoolVar(&cleanImages, "images", false, "also remove pulled OCI image layer cache")
+	cleanCmd.Flags().BoolVar(&cleanAll, "all", false, "remove all cached data (rootfs, images, blobs, state)")
 	rootCmd.AddCommand(cleanCmd)
 }
