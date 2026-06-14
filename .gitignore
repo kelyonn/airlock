@@ -17,3 +17,6 @@ Thumbs.db
 
 # Airlock data (local only)
 .airlock/
+
+# Generated documentation
+docs/

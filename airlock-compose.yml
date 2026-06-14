@@ -1,0 +1,14 @@
+version: "1.0"
+services:
+  database:
+    image: redis:alpine
+    command: redis-server
+    memory: 256m
+
+  web:
+    image: python:alpine
+    command: python3 -m http.server 80
+    ports:
+      - "8080:80"
+    depends_on:
+      - database

@@ -56,7 +56,7 @@ func SetupBridge() error {
 	}
 
 	// Enable IPv4 forwarding
-	if err := runCmd("sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
+	if err := runCmd("sysctl", "net.ipv4.ip_forward=1"); err != nil {
 		return fmt.Errorf("enable ip_forward: %w", err)
 	}
 

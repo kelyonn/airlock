@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 // Child is called inside the new namespaces. It sets up chroot, mounts,
@@ -145,11 +146,20 @@ func configureContainerNetwork(containerIP string) error {
 	}
 
 	// --- eth0 ---
-	// The parent already assigned the IP via nsenter; just bring the link up.
-	if err := runCmd("ip", "link", "set", "eth0", "up"); err != nil {
-		if err2 := runCmd("ifconfig", "eth0", "up"); err2 != nil {
-			fmt.Fprintf(os.Stderr, "warning: bring up eth0: %v\n", err2)
+	// The parent assigns the IP via nsenter, but the child might race ahead of the parent.
+	// We retry bringing up the link up to 10 times (100ms max) to wait for the parent to finish injecting it.
+	var eth0Err error
+	for i := 0; i < 10; i++ {
+		if eth0Err = runCmd("ip", "link", "set", "eth0", "up"); eth0Err == nil {
+			break
+		} else if err2 := runCmd("ifconfig", "eth0", "up"); err2 == nil {
+			eth0Err = nil
+			break
 		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if eth0Err != nil {
+		fmt.Fprintf(os.Stderr, "warning: bring up eth0 failed after retries: %v\n", eth0Err)
 	}
 
 	// --- default route ---
