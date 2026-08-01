@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/kelyonn/airlock/internal/filelock"
 )
 
 // Container represents a running container's state.
@@ -32,34 +35,18 @@ func stateFilePath() (string, error) {
 	return filepath.Join(home, ".airlock", "containers.json"), nil
 }
 
-// withLock acquires an exclusive flock on a lock file alongside the state file,
-// runs fn, and releases the lock.  This makes Register/Unregister/List safe
-// across multiple concurrent airlock processes (e.g. compose goroutines).
+// withLock acquires an exclusive lock on the state file (via internal/filelock)
+// and runs fn.  This makes Register/Unregister/List safe across multiple
+// concurrent airlock processes (e.g. compose stacks starting several
+// containers at once).
 func withLock(fn func(statePath string) error) error {
 	path, err := stateFilePath()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-
-	// Use a dedicated lock file so we never hold an exclusive lock on the
-	// state JSON itself (which would block readers expecting an open file).
-	lockPath := path + ".lock"
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return fmt.Errorf("open lock file: %w", err)
-	}
-	defer lf.Close()
-
-	// LOCK_EX blocks until the lock is available.
-	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("acquire state lock: %w", err)
-	}
-	defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN) // nolint:errcheck
-
-	return fn(path)
+	return filelock.WithLock(path, func() error {
+		return fn(path)
+	})
 }
 
 // loadUnlocked reads and returns all containers from the state file.
@@ -197,4 +184,37 @@ func ListByCompose(composeFile string) ([]Container, error) {
 		}
 	}
 	return match, nil
+}
+
+// Resolve finds the single running container whose ID starts with prefix —
+// the same kind of short-ID lookup `docker exec`/`docker stop` accept, so
+// users can pass the truncated 12-character ID `airlock ps` prints instead
+// of the full PID-derived one. Returns an error if no container matches,
+// or if more than one does (asks the caller to be more specific rather
+// than guessing).
+func Resolve(prefix string) (Container, error) {
+	if prefix == "" {
+		return Container{}, fmt.Errorf("container ID cannot be empty")
+	}
+
+	containers, err := List()
+	if err != nil {
+		return Container{}, err
+	}
+
+	var matches []Container
+	for _, c := range containers {
+		if c.ID == prefix || strings.HasPrefix(c.ID, prefix) {
+			matches = append(matches, c)
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return Container{}, fmt.Errorf("no running container matches ID %q", prefix)
+	case 1:
+		return matches[0], nil
+	default:
+		return Container{}, fmt.Errorf("ID %q is ambiguous — matches %d running containers, use more characters", prefix, len(matches))
+	}
 }
