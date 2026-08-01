@@ -23,3 +23,8 @@ func Run(config Config) error {
 func Child(args []string) error {
 	return fmt.Errorf("container child process can only run on Linux (current OS: %s)", runtime.GOOS)
 }
+
+// Exec is a stub for non-Linux platforms.
+func Exec(targetPID int, command string, args []string) error {
+	return fmt.Errorf("airlock exec is only supported on Linux (current OS: %s)", runtime.GOOS)
+}

@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kelyonnnn17/airlock/container"
+	"github.com/kelyonn/airlock/container"
 	"github.com/spf13/cobra"
 )
 
@@ -17,10 +17,13 @@ var (
 	noSeccomp    bool
 	portForwards []string // raw -p specs e.g. "8080:80"
 	noNetwork    bool
+	workingDir   string
+	userSpec     string
+	userNS       bool
 )
 
 var runCmd = &cobra.Command{
-	Use:   "run [OPTIONS] IMAGE COMMAND [ARGS...]",
+	Use:   "run [OPTIONS] IMAGE [COMMAND] [ARGS...]",
 	Short: "Run a command inside a new container",
 	Long: `Run launches a new isolated container and executes the given command inside it.
 The container uses Linux namespaces, chroot, and cgroups for isolation.
@@ -29,7 +32,13 @@ The first positional argument is treated as an OCI image reference (e.g. "alpine
 "ubuntu:24.04", "ghcr.io/owner/repo:tag"). If it starts with "/" it is treated as a
 bare command using the default Alpine rootfs (legacy mode).
 
+COMMAND is optional when an image is given: with no trailing command, the
+image's own ENTRYPOINT/CMD is used, the same defaults "docker run" falls
+back to — so "airlock run nginx:alpine" works without spelling out
+nginx's own startup command by hand.
+
 Examples:
+  airlock run nginx:alpine                    (uses the image's own ENTRYPOINT/CMD)
   airlock run alpine:3.20 /bin/sh
   airlock run ubuntu:24.04 /bin/bash -c "echo hello"
   airlock run --memory 256m --cpu 80 alpine /bin/sh
@@ -70,14 +79,15 @@ Examples:
 			command = args[0]
 			cmdArgs = args[1:]
 		} else {
-			// New mode: airlock run alpine:3.20 /bin/sh [args...]
+			// New mode: airlock run alpine:3.20 [/bin/sh [args...]]
 			imageRef = args[0]
-			if len(args) < 2 {
-				fmt.Fprintf(os.Stderr, "error: must specify a command after the image (e.g. airlock run alpine /bin/sh)\n")
-				os.Exit(1)
+			if len(args) >= 2 {
+				command = args[1]
+				cmdArgs = args[2:]
 			}
-			command = args[1]
-			cmdArgs = args[2:]
+			// No trailing command is fine here — container.Run falls back to
+			// the image's own ENTRYPOINT/CMD and errors clearly if the image
+			// doesn't have one either.
 		}
 
 		config := container.Config{
@@ -92,6 +102,9 @@ Examples:
 			Image:        imageRef,
 			NoNetwork:    noNetwork,
 			PortForwards: pfs,
+			WorkingDir:   workingDir,
+			User:         userSpec,
+			UserNS:       userNS,
 		}
 
 		if err := container.Run(config); err != nil {
@@ -109,6 +122,9 @@ func init() {
 	runCmd.Flags().BoolVar(&noSeccomp, "no-seccomp", false, "disable seccomp syscall filtering (for debugging)")
 	runCmd.Flags().StringArrayVarP(&portForwards, "publish", "p", nil, "publish a container port: host_port:container_port (repeatable)")
 	runCmd.Flags().BoolVar(&noNetwork, "no-network", false, "disable container networking")
+	runCmd.Flags().StringVarP(&workingDir, "workdir", "w", "", "working directory inside the container (defaults to the image's own WORKDIR, or /)")
+	runCmd.Flags().StringVarP(&userSpec, "user", "u", "", `user to run as, as "uid", "uid:gid", "name", or "name:group" (defaults to the image's own USER, or root)`)
+	runCmd.Flags().BoolVar(&userNS, "userns", false, "[EXPERIMENTAL, currently non-functional] isolate with a Linux user namespace (see README's Security model section)")
 	// Stop flag parsing after the first positional arg (the image or command).
 	// Without this, `airlock run alpine /bin/sh -c "cmd"` would try to parse -c as an airlock flag.
 	runCmd.Flags().SetInterspersed(false)
