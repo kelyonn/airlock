@@ -6,16 +6,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 )
 
 const cgroupRoot = "/sys/fs/cgroup"
 
-// SetupCgroups applies resource limits using cgroups v2.
-// It first tries to create a child cgroup. If that fails (e.g., inside Docker
-// where we're already in a leaf cgroup), it writes limits directly to the
-// current cgroup.
+// SetupCgroups applies resource limits using cgroups v2, by creating a
+// dedicated child cgroup for this container and moving the process into it.
+//
+// If a child cgroup can't be created (e.g. this process's own cgroup
+// doesn't have the memory/cpu controllers delegated to it — common when
+// airlock itself is being run inside another container for development),
+// limits are skipped entirely rather than applied. An earlier version
+// fell back to writing memory.max/cpu.max directly onto THIS process's own
+// current cgroup — which, since the "child" process hasn't been moved
+// anywhere at that point, is the cgroup it still shares with the parent
+// airlock process (and, inside a container, potentially the whole
+// container's other processes too). Capping that shared cgroup to the
+// container's configured memory limit (100m by default) doesn't sandbox
+// just the container — it can OOM-kill the parent airlock process and
+// anything else sharing that cgroup the moment combined usage crosses the
+// limit, which for image pulling/extraction of anything beyond a tiny
+// single-layer image is trivial to hit. Skipping the limit is strictly
+// safer than mis-scoping it.
 // Returns a cleanup function to remove the cgroup when the container exits.
 func SetupCgroups(memoryLimit string, cpuPercent int) (func(), error) {
 	pid := os.Getpid()
@@ -25,15 +37,16 @@ func SetupCgroups(memoryLimit string, cpuPercent int) (func(), error) {
 		return nil, fmt.Errorf("invalid memory limit: %w", err)
 	}
 
-	// Try to create a child cgroup first (the "proper" way)
 	cgroupPath, useChild := tryCreateChildCgroup(pid)
+	if !useChild {
+		fmt.Fprintln(os.Stderr, "info: could not create a delegated child cgroup — skipping resource limits (not applying them to a shared cgroup)")
+		return func() {}, nil
+	}
 
 	cleanup := func() {
-		if useChild {
-			// Move process back to parent and remove child cgroup
-			os.WriteFile(filepath.Join(cgroupRoot, "cgroup.procs"), []byte(fmt.Sprintf("%d", pid)), 0644)
-			os.Remove(cgroupPath)
-		}
+		// Move process back to parent and remove child cgroup
+		os.WriteFile(filepath.Join(cgroupRoot, "cgroup.procs"), []byte(fmt.Sprintf("%d", pid)), 0644)
+		os.Remove(cgroupPath)
 	}
 
 	// Apply memory limit
@@ -56,13 +69,11 @@ func SetupCgroups(memoryLimit string, cpuPercent int) (func(), error) {
 		}
 	}
 
-	// If using a child cgroup, move this process into it
-	if useChild {
-		procsFile := filepath.Join(cgroupPath, "cgroup.procs")
-		if err := os.WriteFile(procsFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("cannot add process to cgroup: %w", err)
-		}
+	// Move this process into the child cgroup.
+	procsFile := filepath.Join(cgroupPath, "cgroup.procs")
+	if err := os.WriteFile(procsFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("cannot add process to cgroup: %w", err)
 	}
 
 	return cleanup, nil
@@ -92,34 +103,4 @@ func tryCreateChildCgroup(pid int) (string, bool) {
 	}
 
 	return cgroupPath, true
-}
-
-// parseMemoryLimit converts a human-readable memory limit to bytes.
-// Supports: "100m", "256m", "1g", "512k", or raw bytes as a number.
-func parseMemoryLimit(limit string) (int64, error) {
-	limit = strings.TrimSpace(strings.ToLower(limit))
-	if limit == "" {
-		return 100 * 1024 * 1024, nil // default 100MB
-	}
-
-	var multiplier int64 = 1
-	numStr := limit
-
-	if strings.HasSuffix(limit, "g") {
-		multiplier = 1024 * 1024 * 1024
-		numStr = strings.TrimSuffix(limit, "g")
-	} else if strings.HasSuffix(limit, "m") {
-		multiplier = 1024 * 1024
-		numStr = strings.TrimSuffix(limit, "m")
-	} else if strings.HasSuffix(limit, "k") {
-		multiplier = 1024
-		numStr = strings.TrimSuffix(limit, "k")
-	}
-
-	num, err := strconv.ParseInt(numStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse '%s': %w", limit, err)
-	}
-
-	return num * multiplier, nil
 }
