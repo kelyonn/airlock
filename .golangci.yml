@@ -1,0 +1,26 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    - gosimple
+  # errcheck is deliberately not enabled: this codebase has a consistent,
+  # intentional style of "best-effort, log and continue" for host-side setup
+  # calls that aren't fatal to a container's success (bridge/iptables idempotency
+  # checks, cgroup writes on hosts that don't delegate controllers, cleanup on
+  # the way out). Enabling it would flag dozens of those as a first pass with
+  # no correctness benefit; narrower error-handling review is better done in
+  # code review than as a blanket lint gate.
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
