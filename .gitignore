@@ -18,5 +18,6 @@ Thumbs.db
 # Airlock data (local only)
 .airlock/
 
-# Generated documentation
-docs/
+# Generated documentation exports (derived from the .md sources, which ARE tracked)
+docs/*.pdf
+docs/*.html
