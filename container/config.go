@@ -1,5 +1,16 @@
 package container
 
+// Verbose controls whether low-level container setup narration (namespace
+// setup, bridge/veth/port-forward wiring, seccomp filter installation) gets
+// printed. It's a package-level flag rather than a parameter threaded
+// through every setup function because several of those (SetupBridge,
+// CreateVethPair) are called both from Run (which has a Config in scope)
+// and directly by the compose orchestrator ahead of any single container's
+// Config existing. Run and Child each set it from their own source of
+// truth (Config.Verbose, and the re-exec'd "child" process's verbose arg,
+// respectively) before doing any setup work.
+var Verbose bool
+
 // VolumeMount represents a bind-mount from a host path into the container.
 // Both paths must be absolute. ReadOnly enforces MS_RDONLY on the mount.
 // This is in a file without build tags so it's available on all platforms
