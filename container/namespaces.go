@@ -78,47 +78,40 @@ func Child(args []string) error {
 	// We do NOT use MS_REC — that causes kernel lock contention when source == destination
 	// and submounts already exist.
 	//
-	// KNOWN LIMITATION with --userns: this mount() call (and pivot_root
-	// itself, a few steps down) requires CAP_SYS_ADMIN in the user
-	// namespace that owns the target filesystem's SUPERBLOCK — not just
-	// DAC/ownership permission on the path, which chownForUserNS already
-	// grants. rootfsDir sits on the host's real filesystem, whose
-	// superblock is owned by the INITIAL user namespace; a --userns
-	// container's mapped-root process only holds CAP_SYS_ADMIN within its
-	// OWN new user namespace, not the initial one, so this fails with
-	// EPERM regardless of file ownership. This is the same reason rootless
-	// Podman/Docker need a FUSE-backed overlay filesystem instead of plain
-	// kernel mount()/pivot_root() for their rootfs — properly fixing this
-	// means mounting the rootfs from a filesystem type created AFTER (and
-	// therefore owned by) the new user namespace, e.g. a fresh overlay
-	// whose lowerdir is the cached image and whose mount happens post
-	// clone(CLONE_NEWUSER), not before. That's a real architecture change,
-	// not a one-line fix, and is not yet implemented — --userns currently
-	// gets you a correctly-created namespace with the intended UID/GID
-	// mapping (verifiable via /proc/self/uid_map and id(1) up to this
-	// point), but the container's actual filesystem setup will fail here.
-	if err := bindRootfsToSelf(rootfsDir); err != nil {
-		return fmt.Errorf("rootfs bind mount failed: %w", err)
+	// --userns skips this: mount() (including MS_BIND) requires
+	// CAP_SYS_ADMIN in the user namespace that owns the TARGET
+	// filesystem's superblock, not just DAC/ownership permission on the
+	// path — and rootfsDir's superblock belongs to the initial namespace,
+	// not this container's. By the time this function runs, Run's parent
+	// process has already done this exact bind-mount itself while still
+	// real root (see container.go's Step 1.6) — clone(CLONE_NEWUSER)
+	// snapshots the mount table at Start() time, so it's already present
+	// here, and attempting it again from the mapped, unprivileged UID
+	// would just fail with EPERM for no benefit.
+	if !userNS {
+		if err := bindRootfsToSelf(rootfsDir); err != nil {
+			return fmt.Errorf("rootfs bind mount failed: %w", err)
+		}
 	}
 
 	// Step 4: Bind-mount volumes into the rootfs AFTER the bind mount but BEFORE pivot_root.
 	// At this point rootfsDir is its own mount point; volumes stack on top cleanly.
-	if len(volumes) > 0 {
+	//
+	// --userns skips this too, for the same reason as the rootfs self-bind
+	// above: Run's parent process already set these up before Start(),
+	// while still real root.
+	if len(volumes) > 0 && !userNS {
 		if err := PrepareVolumeMounts(rootfsDir, volumes); err != nil {
 			return fmt.Errorf("volume mount failed: %w", err)
 		}
 	}
 
-	// Step 4.5: With --userns active, mknod for a real device node is
-	// refused outside the initial user namespace (see devices.go), so the
-	// standard device files have to be bind-mounted from the host instead
-	// — which, like volumes, only works while the host's /dev is still
-	// reachable, i.e. before pivot_root.
-	if userNS {
-		if err := bindHostDeviceFilesForUserNS(rootfsDir); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: device file setup failed: %v\n", err)
-		}
-	}
+	// (Step 4.5 used to bind-mount the standard device files here for
+	// --userns — mknod for a real device node is refused outside the
+	// initial user namespace, see devices.go — but that's the same
+	// "requires CAP_SYS_ADMIN over the target's superblock" problem as the
+	// rootfs self-bind above. Run's parent process handles it before
+	// Start() now, for the same reason.)
 
 	// Step 5: Complete the chroot by performing pivot_root
 	if err := completePivotRoot(rootfsDir); err != nil {

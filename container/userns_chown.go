@@ -37,3 +37,64 @@ func chownForUserNS(root string) error {
 		return nil
 	})
 }
+
+// ensureTraversableForUserNS grants execute ("search") permission to
+// "other" on every directory between $HOME and path — NOT path itself,
+// chownForUserNS already makes that tree owned outright by the mapped UID.
+//
+// Owning a directory tree outright isn't enough to reach it: every
+// component along the way is checked separately for search permission,
+// and ~/.airlock (like most of a fresh $HOME) defaults to mode 0700 owned
+// by real root. A mapped UID that owns the rootfs completely still gets
+// EPERM the moment it tries to reach it, because it can't even traverse
+// through ~/.airlock's own default permissions to get there — confirmed
+// by hand: pivot_root's own os.MkdirAll failed with "permission denied"
+// on ~/.airlock itself, several levels above the (correctly owned) rootfs.
+//
+// This only ever adds the execute bit, never read or write, so it doesn't
+// let another local user list or read what's inside ~/.airlock's
+// directories — only pass through a path they'd have to already know, to
+// reach something they (here, the mapped UID) have separate permission on
+// further down. Stops at $HOME rather than continuing up to "/", since
+// everything above a user's home directory is outside airlock's own data
+// and ordinarily already traversable by default on any standard install.
+func ensureTraversableForUserNS(path string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("determine home directory: %w", err)
+	}
+	home = filepath.Clean(home)
+
+	var ancestors []string
+	dir := filepath.Dir(filepath.Clean(path))
+	for {
+		ancestors = append(ancestors, dir)
+		if dir == home {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached the filesystem root without finding $HOME along the
+			// way (path wasn't under $HOME at all) — stop rather than
+			// looping forever or touching directories airlock has no
+			// business modifying.
+			break
+		}
+		dir = parent
+	}
+
+	for _, d := range ancestors {
+		info, statErr := os.Stat(d)
+		if statErr != nil {
+			continue
+		}
+		mode := info.Mode().Perm()
+		if mode&0o001 != 0 {
+			continue // already traversable by "other"
+		}
+		if chmodErr := os.Chmod(d, mode|0o001); chmodErr != nil {
+			return fmt.Errorf("chmod %s: %w", d, chmodErr)
+		}
+	}
+	return nil
+}

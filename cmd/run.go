@@ -124,7 +124,7 @@ func init() {
 	runCmd.Flags().BoolVar(&noNetwork, "no-network", false, "disable container networking")
 	runCmd.Flags().StringVarP(&workingDir, "workdir", "w", "", "working directory inside the container (defaults to the image's own WORKDIR, or /)")
 	runCmd.Flags().StringVarP(&userSpec, "user", "u", "", `user to run as, as "uid", "uid:gid", "name", or "name:group" (defaults to the image's own USER, or root)`)
-	runCmd.Flags().BoolVar(&userNS, "userns", false, "[EXPERIMENTAL, currently non-functional] isolate with a Linux user namespace (see README's Security model section)")
+	runCmd.Flags().BoolVar(&userNS, "userns", false, "isolate with a Linux user namespace: container root maps to an unprivileged host UID instead of real root (see README's Security model section)")
 	// Stop flag parsing after the first positional arg (the image or command).
 	// Without this, `airlock run alpine /bin/sh -c "cmd"` would try to parse -c as an airlock flag.
 	runCmd.Flags().SetInterspersed(false)

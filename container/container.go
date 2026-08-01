@@ -131,6 +131,14 @@ func Run(config Config) error {
 		if err := chownForUserNS(containerRootfs); err != nil {
 			return fmt.Errorf("prepare rootfs ownership for --userns: %w", err)
 		}
+		// Owning the rootfs tree outright still isn't sufficient to reach
+		// it — every directory between $HOME and it is checked separately
+		// for search permission, and ~/.airlock defaults to mode 0700
+		// owned by real root like the rest of a fresh $HOME. See
+		// ensureTraversableForUserNS's doc comment for the full story.
+		if err := ensureTraversableForUserNS(containerRootfs); err != nil {
+			return fmt.Errorf("prepare rootfs path for --userns: %w", err)
+		}
 	}
 
 	// Step 1.5: Validate that all host volume paths exist before starting the child.
@@ -138,6 +146,51 @@ func Run(config Config) error {
 	for _, vol := range config.Volumes {
 		if _, err := os.Stat(vol.HostPath); err != nil {
 			return fmt.Errorf("volume host path does not exist: %s", vol.HostPath)
+		}
+	}
+
+	// Step 1.6: --userns only. Every bind-mount Child() would normally set
+	// up itself (rootfs-to-self, volumes, the standard device files) has to
+	// happen HERE instead, in this still-real-root parent, before Start().
+	//
+	// The reason is a kernel rule that isn't about DAC permissions at all:
+	// mount() — including MS_BIND — requires CAP_SYS_ADMIN in the user
+	// namespace that owns the TARGET filesystem's superblock, not just
+	// ownership of or access to the path. containerRootfs sits on the
+	// host's real filesystem, whose superblock belongs to the *initial*
+	// user namespace. Once CLONE_NEWUSER takes effect, the child only has
+	// CAP_SYS_ADMIN within its own new namespace — chownForUserNS already
+	// grants it DAC write access to the tree, but that's a separate check,
+	// and mount() still refuses it. Confirmed by hand: bindRootfsToSelf
+	// failed with EPERM here even after the chown, on a plain --userns run
+	// with no volumes at all.
+	//
+	// Doing the mounting here instead sidesteps the problem rather than
+	// solving it: this parent process is still real root in the initial
+	// namespace, so none of these calls are restricted. clone(CLONE_NEWNS)
+	// takes a snapshot of the calling process's mount table at the moment
+	// of Start() — so every mount set up here, right before Start(), is
+	// already present in the child's own freshly-cloned mount namespace
+	// the instant it exists, with no further mount() calls required once
+	// the child is actually running as the mapped, unprivileged UID.
+	//
+	// completePivotRoot's own pivot_root attempt will still fail under
+	// --userns for the same superblock-ownership reason — pivot_root is
+	// itself a mount-namespace operation — but its existing chroot(2)
+	// fallback works: CAP_SYS_CHROOT is checked against the CALLING
+	// process's own (new) namespace, not the target filesystem's
+	// superblock, so it isn't subject to this restriction at all.
+	if config.UserNS {
+		if err := bindRootfsToSelf(containerRootfs); err != nil {
+			return fmt.Errorf("prepare rootfs mount point for --userns: %w", err)
+		}
+		if len(config.Volumes) > 0 {
+			if err := PrepareVolumeMounts(containerRootfs, config.Volumes); err != nil {
+				return fmt.Errorf("prepare volume mounts for --userns: %w", err)
+			}
+		}
+		if err := bindHostDeviceFilesForUserNS(containerRootfs); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: prepare device files for --userns: %v\n", err)
 		}
 	}
 

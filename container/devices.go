@@ -47,7 +47,12 @@ var standardDevNodes = []devNode{
 // DAC permissions on the host device files themselves (owned by the real
 // root, typically mode 0666 for exactly these six) still apply.
 //
-// Must run BEFORE pivot_root, while the host's /dev is still reachable.
+// Called from Run, in the parent process, before Start() — not from
+// Child() after the fact. Bind-mounting from a host-owned source hits the
+// same "mount() needs CAP_SYS_ADMIN over the target's superblock" rule
+// that blocks bindRootfsToSelf under --userns (see the comment at that
+// call in namespaces.go); doing it here, while this process is still real
+// root in the initial namespace, sidesteps it the same way.
 func bindHostDeviceFilesForUserNS(rootfsDir string) error {
 	destDir := filepath.Join(rootfsDir, "dev")
 	if err := os.MkdirAll(destDir, 0755); err != nil {
