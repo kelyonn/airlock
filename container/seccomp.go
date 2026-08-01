@@ -18,36 +18,11 @@ const (
 	seccompRetAllow = uint32(0x7fff0000) // allow the syscall
 )
 
-// auditArchX86_64 is the AUDIT_ARCH value for x86_64 (EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE)
-const auditArchX86_64 = uint32(0xc000003e)
-
 // Offsets into the seccomp_data struct passed to BPF programs by the kernel
 const (
 	seccompDataNrOffset   = uint32(0) // syscall number
 	seccompDataArchOffset = uint32(4) // architecture
 )
-
-// blockedSyscalls is the curated list of syscalls blocked inside airlock containers.
-var blockedSyscalls = []uint32{
-	unix.SYS_REBOOT,          // reboot the host
-	unix.SYS_KEXEC_LOAD,      // load a new kernel image
-	unix.SYS_SWAPON,          // enable a swap device
-	unix.SYS_SWAPOFF,         // disable a swap device
-	unix.SYS_MOUNT,           // remount host filesystems
-	unix.SYS_PIVOT_ROOT,      // escape the container root
-	unix.SYS_SETTIMEOFDAY,    // manipulate the host clock
-	unix.SYS_PERF_EVENT_OPEN, // open perf events (side-channel attacks)
-}
-
-// bpfStmt creates a no-jump BPF instruction.
-func bpfStmt(code uint16, k uint32) unix.SockFilter {
-	return unix.SockFilter{Code: code, K: k}
-}
-
-// bpfJump creates a conditional-jump BPF instruction.
-func bpfJump(code uint16, k uint32, jt, jf uint8) unix.SockFilter {
-	return unix.SockFilter{Code: code, Jt: jt, Jf: jf, K: k}
-}
 
 // seccompUnavailableMsg is printed when the environment doesn't support seccomp.
 const seccompUnavailableMsg = "   ⚠️  Seccomp: skipped (not supported in this kernel/environment)"
@@ -71,33 +46,29 @@ func isLinuxtKitVM() bool {
 	return strings.Contains(strings.ToLower(string(data)), "linuxkit")
 }
 
-// ApplySeccomp installs a pure-Go BPF seccomp filter that blocks a curated
-// set of dangerous syscalls from within the container.
-//
-// Environments where seccomp is not installed (returned early):
-//   - Docker Desktop / linuxkit VM: prctl(PR_SET_SECCOMP) triggers a kernel
-//     RCU synchronization deadlock on single-vCPU VMs. We detect linuxkit and
-//     skip gracefully rather than hanging indefinitely.
-//   - Any environment where PR_SET_NO_NEW_PRIVS or PR_SET_SECCOMP returns an
-//     error (e.g., some hardened CI that blocks nested seccomp) — we log a
-//     warning and continue.
-func ApplySeccomp() error {
-	// Environment-based fast-path: skip seccomp in known-deadlocking environments.
-	if isLinuxtKitVM() {
-		fmt.Fprintf(os.Stderr, "%s\n", seccompUnavailableMsg)
-		return nil
-	}
+// bpfStmt creates a no-jump BPF instruction.
+func bpfStmt(code uint16, k uint32) unix.SockFilter {
+	return unix.SockFilter{Code: code, K: k}
+}
 
-	// Build the BPF program:
-	//   [0]  Load arch field from seccomp_data
-	//   [1]  If arch == x86_64: skip [2]; else fall through to [2]
-	//   [2]  KILL (wrong architecture — reject unknown arch binaries)
-	//   [3]  Load syscall number
-	//   [4…] Per-syscall: JEQ blockedNR → EPERM
-	//   [N]  Default: ALLOW
+// bpfJump creates a conditional-jump BPF instruction.
+func bpfJump(code uint16, k uint32, jt, jf uint8) unix.SockFilter {
+	return unix.SockFilter{Code: code, Jt: jt, Jf: jf, K: k}
+}
+
+// buildFilter assembles the BPF program for a given architecture audit value
+// and set of blocked syscall numbers:
+//
+//	[0]  Load arch field from seccomp_data
+//	[1]  If arch == auditArch: skip [2]; else fall through to [2]
+//	[2]  KILL (wrong architecture — reject unknown arch binaries)
+//	[3]  Load syscall number
+//	[4…] Per-syscall: JEQ blockedNR → EPERM
+//	[N]  Default: ALLOW
+func buildFilter(auditArch uint32, blockedSyscalls []uint32) []unix.SockFilter {
 	filter := []unix.SockFilter{
 		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataArchOffset),
-		bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, auditArchX86_64, 1, 0),
+		bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, auditArch, 1, 0),
 		bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetKill),
 		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataNrOffset),
 	}
@@ -108,7 +79,14 @@ func ApplySeccomp() error {
 		)
 	}
 	filter = append(filter, bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetAllow))
+	return filter
+}
 
+// installFilter installs a fully-assembled BPF program as this thread's
+// seccomp filter. It is architecture-independent; callers assemble the
+// filter with buildFilter using their architecture's AUDIT_ARCH value and
+// blocked syscall table.
+func installFilter(filter []unix.SockFilter) error {
 	prog := unix.SockFprog{
 		Len:    uint16(len(filter)),
 		Filter: &filter[0],
@@ -139,6 +117,5 @@ func ApplySeccomp() error {
 		return fmt.Errorf("prctl(PR_SET_SECCOMP): %w", errno)
 	}
 
-	fmt.Printf("   🔐 Seccomp: blocking %d dangerous syscalls\n", len(blockedSyscalls))
 	return nil
 }
