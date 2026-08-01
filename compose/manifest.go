@@ -3,8 +3,11 @@ package compose
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/kelyonn/airlock/internal/shellwords"
 )
 
 // Manifest represents the parsed airlock-compose.yml file.
@@ -15,14 +18,60 @@ type Manifest struct {
 
 // ServiceDef defines a single container in the compose manifest.
 type ServiceDef struct {
-	Image       string   `yaml:"image"`
-	Command     string   `yaml:"command"`
-	Ports       []string `yaml:"ports"`
-	Volumes     []string `yaml:"volumes"`
-	Memory      string   `yaml:"memory"`
-	CPU         int      `yaml:"cpu"`
-	DependsOn   []string `yaml:"depends_on"`
-	Environment []string `yaml:"environment"`
+	Image       string        `yaml:"image"`
+	Command     StringOrSlice `yaml:"command"`
+	Ports       []string      `yaml:"ports"`
+	Volumes     []string      `yaml:"volumes"`
+	Memory      string        `yaml:"memory"`
+	CPU         int           `yaml:"cpu"`
+	DependsOn   []string      `yaml:"depends_on"`
+	Environment []string      `yaml:"environment"`
+	WorkingDir  string        `yaml:"working_dir"`
+	User        string        `yaml:"user"`
+}
+
+// StringOrSlice supports a compose "command" field written either as a
+// single shell-like string:
+//
+//	command: nginx -g "daemon off;"
+//
+// or as an explicit argv array:
+//
+//	command: ["nginx", "-g", "daemon off;"]
+//
+// The string form used to be split with strings.Fields, which has no
+// concept of quoting — `nginx -g "daemon off;"` (the exact example in this
+// project's own README) came out as ["nginx", "-g", `"daemon`, `off;"`],
+// four broken arguments instead of three correct ones. The array form is
+// the only way to express an argument containing a space without this kind
+// of ambiguity; the string form now goes through internal/shellwords so
+// quoted arguments survive intact either way.
+type StringOrSlice []string
+
+// UnmarshalYAML implements yaml.Unmarshaler for StringOrSlice.
+func (s *StringOrSlice) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		var str string
+		if err := value.Decode(&str); err != nil {
+			return err
+		}
+		parts, err := shellwords.Split(str)
+		if err != nil {
+			return fmt.Errorf("command: %w", err)
+		}
+		*s = parts
+		return nil
+	case yaml.SequenceNode:
+		var parts []string
+		if err := value.Decode(&parts); err != nil {
+			return err
+		}
+		*s = parts
+		return nil
+	default:
+		return fmt.Errorf("command: expected a string or a list of strings")
+	}
 }
 
 // ParseManifest reads and parses the compose YAML file.
@@ -89,10 +138,21 @@ func validateDAG(services map[string]ServiceDef) error {
 	return nil
 }
 
-// TopoSort returns the service names in topological order (dependencies first).
+// TopoSort returns the service names in topological order (dependencies
+// first). Services with no dependency relationship to each other are
+// ordered alphabetically, so the same manifest always produces the same
+// startup order — Go's map iteration is randomized per-run, and without
+// sorting the visit order here, two runs of the same stack could start
+// independent services in a different sequence each time.
 func TopoSort(services map[string]ServiceDef) []string {
 	var order []string
 	visited := make(map[string]bool)
+
+	names := make([]string, 0, len(services))
+	for name := range services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 
 	var visit func(node string)
 	visit = func(node string) {
@@ -100,19 +160,15 @@ func TopoSort(services map[string]ServiceDef) []string {
 			return
 		}
 		visited[node] = true
-		for _, dep := range services[node].DependsOn {
+		deps := append([]string(nil), services[node].DependsOn...)
+		sort.Strings(deps)
+		for _, dep := range deps {
 			visit(dep)
 		}
 		order = append(order, node)
 	}
 
-	// Sort keys alphabetically for deterministic output
-	// (Go maps iteration is randomized)
-	// We do a simple insertion sort for keys here to avoid bringing in "sort"
-	// just for this, but since we can't import it easily without changing standard libs, let's just use it.
-	// Actually, let's just iterate normally; map randomization might mean different startup orders
-	// for independent services, which is fine and typical for docker-compose.
-	for name := range services {
+	for _, name := range names {
 		visit(name)
 	}
 	return order
