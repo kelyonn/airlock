@@ -5,13 +5,14 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/kelyonnnn17/airlock/image"
+	"github.com/kelyonn/airlock/image"
 	"github.com/spf13/cobra"
 )
 
 var (
 	cleanImages bool
 	cleanAll    bool
+	cleanVerify bool
 )
 
 var cleanCmd = &cobra.Command{
@@ -29,6 +30,30 @@ Use --images to also remove pulled OCI image layers, or --all to remove everythi
 		}
 
 		airlockDir := filepath.Join(home, ".airlock")
+
+		// --verify: re-hash every cached blob against its digest and remove
+		// any that fail. Useful for catching blobs cached before digest
+		// verification was added on download, or corrupted on disk since.
+		if cleanVerify {
+			bad, err := image.VerifyAllCachedBlobs()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error verifying blob cache: %v\n", err)
+				os.Exit(1)
+			}
+			if len(bad) == 0 {
+				fmt.Println("✓ All cached blobs verified OK")
+				return
+			}
+			fmt.Printf("⚠ %d blob(s) failed verification, removing:\n", len(bad))
+			for _, digest := range bad {
+				path, err := image.BlobCachePath(digest)
+				if err == nil {
+					os.Remove(path)
+				}
+				fmt.Printf("   - %s\n", digest)
+			}
+			return
+		}
 
 		// --all: wipe the entire ~/.airlock directory.
 		if cleanAll {
@@ -102,5 +127,6 @@ func formatBytes(b int64) string {
 func init() {
 	cleanCmd.Flags().BoolVar(&cleanImages, "images", false, "also remove pulled OCI image layer cache")
 	cleanCmd.Flags().BoolVar(&cleanAll, "all", false, "remove all cached data (rootfs, images, blobs, state)")
+	cleanCmd.Flags().BoolVar(&cleanVerify, "verify", false, "verify cached blob digests and remove any that fail")
 	rootCmd.AddCommand(cleanCmd)
 }

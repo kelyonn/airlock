@@ -1,6 +1,8 @@
 package image
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -118,6 +120,22 @@ func FetchManifest(ref ImageRef, token string) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("fetch manifest returned HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Read the full body so we can verify it against ref.Digest (when the
+	// caller requested a specific digest) before trusting any of its content.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("read manifest body: %w", err)
+	}
+
+	if ref.Digest != "" {
+		wantHex := strings.TrimPrefix(ref.Digest, "sha256:")
+		sum := sha256.Sum256(body)
+		gotHex := hex.EncodeToString(sum[:])
+		if !strings.EqualFold(gotHex, wantHex) {
+			return Manifest{}, fmt.Errorf("manifest digest mismatch: expected sha256:%s, got sha256:%s", wantHex, gotHex)
+		}
+	}
+
 	// Check whether the registry returned a manifest list / OCI index instead of
 	// a single-arch manifest.  This happens for multi-arch images on Docker Hub.
 	contentType := resp.Header.Get("Content-Type")
@@ -126,7 +144,7 @@ func FetchManifest(ref ImageRef, token string) (Manifest, error) {
 
 	if isManifestList {
 		var ml ManifestList
-		if err := json.NewDecoder(resp.Body).Decode(&ml); err != nil {
+		if err := json.Unmarshal(body, &ml); err != nil {
 			return Manifest{}, fmt.Errorf("decode manifest list: %w", err)
 		}
 
@@ -166,7 +184,7 @@ func FetchManifest(ref ImageRef, token string) (Manifest, error) {
 	}
 
 	var m Manifest
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+	if err := json.Unmarshal(body, &m); err != nil {
 		return Manifest{}, fmt.Errorf("decode manifest: %w", err)
 	}
 
