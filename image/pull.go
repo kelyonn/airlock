@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/kelyonn/airlock/internal/filelock"
 )
 
 // Pull ensures the named image is locally cached and returns the path to its
@@ -25,9 +27,54 @@ import (
 //  4. Downloads any missing layer blobs.
 //  5. Extracts each layer in order (bottom-most first) with whiteout support.
 //  6. Writes a .airlock-pulled marker so future calls skip the download.
+//
+// The whole cache-check-through-extract sequence runs under a per-image
+// flock (internal/filelock): two airlock processes pulling the SAME
+// currently-uncached image at the same moment — e.g. two overlapping
+// `airlock run` calls, or a compose stack with two services on the same
+// base image — used to both see IsCached() == false and both extract into
+// the same shared rootfs directory concurrently, which can interleave
+// tar-extraction writes badly (one process's whiteout deletion racing
+// another's file creation) and corrupt the cached rootfs for everyone. The
+// lock is keyed per-image, so pulls of different images still run in
+// parallel; only two pulls of the identical image serialize, and the
+// second one becomes an instant cache hit once the first finishes.
 func Pull(ref string, verbose bool) (string, ImageConfig, error) {
 	imgRef := ParseReference(ref)
 
+	lockPath, err := pullLockPath(imgRef)
+	if err != nil {
+		return "", ImageConfig{}, fmt.Errorf("pull lock path: %w", err)
+	}
+
+	var rootfsDir string
+	var imgConfig ImageConfig
+	err = filelock.WithLock(lockPath, func() error {
+		var pullErr error
+		rootfsDir, imgConfig, pullErr = pullLocked(imgRef, verbose)
+		return pullErr
+	})
+	if err != nil {
+		return "", ImageConfig{}, err
+	}
+	return rootfsDir, imgConfig, nil
+}
+
+// pullLockPath returns a per-image lock file path — a sibling of the
+// image's own cache directory, so it doesn't need that directory to exist
+// yet (true on a first-ever pull, when the lock must already be held
+// before anything is created).
+func pullLockPath(ref ImageRef) (string, error) {
+	dir, err := ImageCacheDir(ref)
+	if err != nil {
+		return "", err
+	}
+	return dir + ".pull.lock", nil
+}
+
+// pullLocked does the actual work described in Pull's doc comment. Callers
+// MUST hold the per-image lock (see Pull).
+func pullLocked(imgRef ImageRef, verbose bool) (string, ImageConfig, error) {
 	// --- Fast-path: already cached ---
 	cached, err := IsCached(imgRef)
 	if err != nil {
