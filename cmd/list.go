@@ -5,7 +5,7 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/kelyonnnn17/airlock/state"
+	"github.com/kelyonn/airlock/state"
 	"github.com/spf13/cobra"
 )
 
