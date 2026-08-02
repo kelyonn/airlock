@@ -220,7 +220,34 @@ func Run(config Config) error {
 
 	// Step 3: Re-execute ourselves with "child" as the first argument.
 	// This new process will be created inside the new namespaces.
-	cmd := reexecCommand(config, containerRootfs, containerIP)
+	//
+	// Networking is configured entirely from THIS side (CreateVethPair,
+	// below) after Start() — necessarily, since it needs the child's PID
+	// to target its network namespace. That leaves a real race: the child
+	// runs concurrently and, once it reaches its own exec, whatever
+	// command the caller gave it might immediately try to use eth0 —
+	// which, timing depending, may not have been renamed/configured yet.
+	// Confirmed by hand: the child's own `ip addr` occasionally still saw
+	// the interface under its pre-rename peer name.
+	//
+	// readyR/readyW is a synchronization pipe (not a race-reducing
+	// optimization — an actual deterministic barrier): its read end is
+	// handed to the child via ExtraFiles (arriving as fd 3), which the
+	// child blocks on immediately before its own final exec. Once
+	// CreateVethPair (and any port forwards) below are done, the parent
+	// closes its write end, which unblocks the child's read with EOF —
+	// exactly like the pattern Go's own os/exec uses internally to
+	// sequence a child past its parent's post-fork setup.
+	readyR, readyW, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create network-ready pipe, proceeding without it: %v\n", pipeErr)
+		readyR, readyW = nil, nil
+	}
+
+	cmd := reexecCommand(config, containerRootfs, containerIP, readyR != nil)
+	if readyR != nil {
+		cmd.ExtraFiles = []*os.File{readyR}
+	}
 
 	cmd.Stdin = os.Stdin
 
@@ -310,7 +337,17 @@ func Run(config Config) error {
 
 	// Step 4: Start the child process
 	if err := cmd.Start(); err != nil {
+		if readyR != nil {
+			readyR.Close()
+			readyW.Close()
+		}
 		return fmt.Errorf("failed to start container: %w", err)
+	}
+	if readyR != nil {
+		// The child has its own independent duplicate of this fd (passed
+		// via ExtraFiles); the parent's copy of the read end serves no
+		// purpose from here on.
+		readyR.Close()
 	}
 
 	// Step 5: Register container in state (before Wait so it appears in `ps`).
@@ -345,6 +382,14 @@ func Run(config Config) error {
 		}
 	}
 
+	// Release the child from the pipe barrier described above Step 3, now
+	// that networking (if any) is actually configured — regardless of
+	// whether it succeeded, since the warnings above already cover
+	// failure and there's nothing left worth making the child wait for.
+	if readyW != nil {
+		readyW.Close()
+	}
+
 	// Step 7: Wait for the child to exit
 	err = cmd.Wait()
 
@@ -370,7 +415,7 @@ func Run(config Config) error {
 //
 //	noSeccomp, containerIP, noNetwork, envJSON, verbose, workingDir, user,
 //	userNS, command, [cmdArgs...]
-func reexecCommand(config Config, rootfsDir, containerIP string) *exec.Cmd {
+func reexecCommand(config Config, rootfsDir, containerIP string, hasReadyPipe bool) *exec.Cmd {
 	volumesJSON, _ := json.Marshal(config.Volumes)
 	envJSON, _ := json.Marshal(config.Env)
 	noSeccomp := "false"
@@ -389,6 +434,10 @@ func reexecCommand(config Config, rootfsDir, containerIP string) *exec.Cmd {
 	if config.UserNS {
 		userNS = "true"
 	}
+	readyPipe := "false"
+	if hasReadyPipe {
+		readyPipe = "true"
+	}
 
 	args := []string{
 		"child",
@@ -405,6 +454,7 @@ func reexecCommand(config Config, rootfsDir, containerIP string) *exec.Cmd {
 		config.WorkingDir,
 		config.User, // may be empty string — means "stay root"
 		userNS,
+		readyPipe,
 		config.Command,
 	}
 	args = append(args, config.Args...)

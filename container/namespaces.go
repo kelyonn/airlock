@@ -17,9 +17,9 @@ import (
 // Args: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON,
 //
 //	noSeccomp, containerIP, noNetwork, envJSON, verbose, workingDir, user,
-//	userNS, command, [command args...]
+//	userNS, readyPipe, command, [command args...]
 func Child(args []string) error {
-	if len(args) < 14 {
+	if len(args) < 15 {
 		return fmt.Errorf("insufficient arguments for child process")
 	}
 
@@ -53,9 +53,10 @@ func Child(args []string) error {
 	workingDir := args[10]
 	userSpec := args[11]
 	userNS := args[12] == "true"
+	hasReadyPipe := args[13] == "true"
 
-	command := args[13]
-	cmdArgs := args[14:]
+	command := args[14]
+	cmdArgs := args[15:]
 
 	// Step 1: Set hostname
 	if err := syscall.Sethostname([]byte(hostname)); err != nil {
@@ -133,16 +134,20 @@ func Child(args []string) error {
 		return fmt.Errorf("failed to mount /proc: %w", err)
 	}
 
-	// Step 8: Write /etc/resolv.conf. Loopback, eth0 (address + up), and the
-	// default route are already fully configured at this point — the
-	// parent process's CreateVethPair (container/network.go) does all of
-	// that over netlink, synchronously, before the veth is even usable, so
-	// there's nothing left for the child to race against or retry here.
-	// (This used to be a 10-iteration retry loop bringing up eth0 with
-	// `ip`/`ifconfig` — a symptom of the parent injecting eth0 well after
-	// this child process had already started. Configuring it host-side as
-	// part of veth creation removes the race at its source instead of
-	// polling around it.)
+	// Step 8: Write /etc/resolv.conf. eth0 itself (rename, address, up,
+	// default route) is configured by the parent's CreateVethPair
+	// (container/network.go) over netlink rather than by this process —
+	// which removes the OLD race this comment used to describe here (a
+	// 10-iteration retry loop bringing up eth0 with `ip`/`ifconfig`,
+	// needed because the parent used to inject eth0 well after this child
+	// had already started trying to configure it itself). It does NOT
+	// remove every race, though: this process and the parent still run
+	// concurrently, and the parent's CreateVethPair call — several netlink
+	// round trips — isn't guaranteed to finish before this process reaches
+	// its own exec. Confirmed by hand: the user's command occasionally ran
+	// fast enough to see the interface still under its pre-rename peer
+	// name. See the wait on the readyPipe fd right before this function's
+	// final exec for how that's actually closed, not just narrowed.
 	if !noNetwork && containerIP != "" {
 		if err := os.WriteFile("/etc/resolv.conf",
 			[]byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0644); err != nil {
@@ -184,6 +189,20 @@ func Child(args []string) error {
 		}
 	} else {
 		fmt.Println("   ⚠️  Seccomp disabled (--no-seccomp)")
+	}
+
+	// Step 10.5: Block until the parent signals that networking (if any)
+	// is actually configured — see the long comment above reexecCommand's
+	// pipe creation in container.go's Run for the full reasoning. fd 3 is
+	// the read end of that pipe, passed via cmd.ExtraFiles; a Read here
+	// returning (for any reason — real data, EOF once the parent closes
+	// its write end, or even an error) means "stop waiting," since there's
+	// nothing left worth blocking on beyond that signal.
+	if hasReadyPipe {
+		readyFile := os.NewFile(3, "ready")
+		var buf [1]byte
+		_, _ = readyFile.Read(buf[:])
+		readyFile.Close()
 	}
 
 	// Step 11: Execute the user's command
