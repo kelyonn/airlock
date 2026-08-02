@@ -400,6 +400,15 @@ func Run(config Config) error {
 	state.Unregister(containerID)
 
 	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			// The container's OWN command exited non-zero (or died from a
+			// signal, which runAsInit already encodes as 128+signal) —
+			// this is the container's business, not an airlock failure.
+			// Returning it as a distinct type lets callers mirror the
+			// exact exit code (the way `docker run` does) instead of
+			// collapsing every non-zero outcome into a generic exit 1.
+			return &ExitError{Code: exitErr.ExitCode()}
+		}
 		return fmt.Errorf("container exited with error: %w", err)
 	}
 
@@ -438,6 +447,10 @@ func reexecCommand(config Config, rootfsDir, containerIP string, hasReadyPipe bo
 	if hasReadyPipe {
 		readyPipe = "true"
 	}
+	initFlag := "false"
+	if config.Init {
+		initFlag = "true"
+	}
 
 	args := []string{
 		"child",
@@ -455,6 +468,7 @@ func reexecCommand(config Config, rootfsDir, containerIP string, hasReadyPipe bo
 		config.User, // may be empty string — means "stay root"
 		userNS,
 		readyPipe,
+		initFlag,
 		config.Command,
 	}
 	args = append(args, config.Args...)

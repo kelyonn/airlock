@@ -20,6 +20,7 @@ var (
 	workingDir   string
 	userSpec     string
 	userNS       bool
+	initFlag     bool
 )
 
 var runCmd = &cobra.Command{
@@ -105,9 +106,19 @@ Examples:
 			WorkingDir:   workingDir,
 			User:         userSpec,
 			UserNS:       userNS,
+			Init:         initFlag,
 		}
 
 		if err := container.Run(config); err != nil {
+			// A plain non-zero exit from the container's own command isn't
+			// an airlock error — mirror its exact exit code silently, the
+			// way `docker run`'s own exit code matches the container's,
+			// rather than printing "error:" for something the user's own
+			// command did on purpose (e.g. `exit 42`) and collapsing every
+			// non-zero outcome into a generic 1.
+			if exitErr, ok := err.(*container.ExitError); ok {
+				os.Exit(exitErr.Code)
+			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -125,6 +136,7 @@ func init() {
 	runCmd.Flags().StringVarP(&workingDir, "workdir", "w", "", "working directory inside the container (defaults to the image's own WORKDIR, or /)")
 	runCmd.Flags().StringVarP(&userSpec, "user", "u", "", `user to run as, as "uid", "uid:gid", "name", or "name:group" (defaults to the image's own USER, or root)`)
 	runCmd.Flags().BoolVar(&userNS, "userns", false, "isolate with a Linux user namespace: container root maps to an unprivileged host UID instead of real root (see README's Security model section)")
+	runCmd.Flags().BoolVar(&initFlag, "init", false, "run the command under a minimal init that forwards signals and reaps zombies (like `docker run --init`); the command is no longer PID 1")
 	// Stop flag parsing after the first positional arg (the image or command).
 	// Without this, `airlock run alpine /bin/sh -c "cmd"` would try to parse -c as an airlock flag.
 	runCmd.Flags().SetInterspersed(false)

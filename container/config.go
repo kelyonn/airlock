@@ -1,5 +1,25 @@
 package container
 
+import "fmt"
+
+// ExitError is returned by Run when the container's own command exited
+// with a non-zero status, as opposed to a genuine airlock-side
+// setup/infrastructure failure (which returns a plain error instead).
+// Callers that want to mirror the container's exact exit code — the way
+// `docker run`'s own exit code matches the container's, silently, with no
+// extra "error:" noise for a plain non-zero exit — should check for this
+// type rather than always exiting 1 on any non-nil error from Run. In an
+// untagged file (rather than alongside Run in the Linux-only
+// container.go) so cross-platform callers like cmd/run.go can type-assert
+// against it without a build-tag mismatch.
+type ExitError struct {
+	Code int
+}
+
+func (e *ExitError) Error() string {
+	return fmt.Sprintf("container exited with status %d", e.Code)
+}
+
 // Verbose controls whether low-level container setup narration (namespace
 // setup, bridge/veth/port-forward wiring, seccomp filter installation) gets
 // printed. It's a package-level flag rather than a parameter threaded
@@ -78,4 +98,21 @@ type Config struct {
 	// default: see the README's "Security model & limitations" section for
 	// why (interacts with device-node creation and cgroup delegation).
 	UserNS bool
+	// Init runs the container's command as a child of a minimal init
+	// process instead of exec'ing it directly as PID 1 — the same
+	// trade-off `docker run --init` offers. Off by default: without it,
+	// the command genuinely IS PID 1 of the container (some tooling
+	// legitimately depends on that), at the cost of the kernel silently
+	// dropping any signal — Ctrl+C, a plain SIGTERM — the command hasn't
+	// explicitly installed a handler for, which is true of most simple
+	// commands and scripts. With Init, the command is no longer PID 1
+	// (some small number above it instead — exactly which one depends on
+	// how many OS threads the Go runtime itself has already claimed PID-
+	// namespace slots for by that point, not something worth relying on
+	// as a fixed value), and the init process forwards signals to it and
+	// reaps orphans. `airlock stop` works either way — it escalates to
+	// SIGKILL, which can't be ignored by anything — just not always
+	// gracefully without this. See namespaces.go's runAsInit for the full
+	// story.
+	Init bool
 }
