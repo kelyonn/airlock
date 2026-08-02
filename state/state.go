@@ -14,14 +14,14 @@ import (
 
 // Container represents a running container's state.
 type Container struct {
-	ID        string `json:"id"`
-	PID       int    `json:"pid"`
-	Command   string `json:"command"`
-	StartedAt string `json:"started_at"`
-	RootfsDir string `json:"rootfs_dir"`
-	CgroupDir string `json:"cgroup_dir"`
-	IPAddress   string `json:"ip_address"` // allocated container IP (empty if --no-network)
-	Image       string `json:"image"`      // OCI image reference (empty if using default Alpine rootfs)
+	ID          string `json:"id"`
+	PID         int    `json:"pid"`
+	Command     string `json:"command"`
+	StartedAt   string `json:"started_at"`
+	RootfsDir   string `json:"rootfs_dir"`
+	CgroupDir   string `json:"cgroup_dir"`
+	IPAddress   string `json:"ip_address"`             // allocated container IP (empty if --no-network)
+	Image       string `json:"image"`                  // OCI image reference (empty if using default Alpine rootfs)
 	ServiceName string `json:"service_name,omitempty"` // for compose
 	ComposeFile string `json:"compose_file,omitempty"` // for compose
 }

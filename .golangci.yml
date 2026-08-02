@@ -8,7 +8,6 @@ linters:
     - unused
     - ineffassign
     - misspell
-    - gosimple
   # errcheck is deliberately not enabled: this codebase has a consistent,
   # intentional style of "best-effort, log and continue" for host-side setup
   # calls that aren't fatal to a container's success (bridge/iptables idempotency

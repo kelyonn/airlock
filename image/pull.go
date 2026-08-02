@@ -421,7 +421,7 @@ func extractLayerTarGz(r io.Reader, dest string) error {
 				return fmt.Errorf("mkdir %s: %w", target, err)
 			}
 
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			// Ensure parent directory exists.
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("mkdir parent %s: %w", filepath.Dir(target), err)

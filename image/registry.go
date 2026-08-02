@@ -148,14 +148,9 @@ func FetchManifest(ref ImageRef, token string) (Manifest, error) {
 			return Manifest{}, fmt.Errorf("decode manifest list: %w", err)
 		}
 
-		// Translate Go's runtime.GOARCH to OCI architecture names.
-		goArch := runtime.GOARCH
-		ociArch := goArch
-		if goArch == "amd64" {
-			ociArch = "amd64"
-		} else if goArch == "arm64" {
-			ociArch = "arm64"
-		}
+		// Go's GOARCH strings already match OCI architecture names for the
+		// architectures airlock supports (amd64, arm64).
+		ociArch := runtime.GOARCH
 
 		// Pick the manifest matching our OS+arch, falling back to first linux entry.
 		var fallback string

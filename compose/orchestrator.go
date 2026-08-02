@@ -318,7 +318,7 @@ func (o *Orchestrator) Down() error {
 		// process was already gone (e.g. a prior crash left a stale state
 		// entry) — both CleanupNetwork and Unregister are safe to call on an
 		// ID that's already been cleaned up.
-		container.CleanupNetwork(c.ID)
+		_ = container.CleanupNetwork(c.ID)
 		state.Unregister(c.ID)
 	}
 

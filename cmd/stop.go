@@ -62,7 +62,7 @@ func stopContainer(c state.Container) error {
 }
 
 func cleanupStoppedContainer(c state.Container) error {
-	container.CleanupNetwork(c.ID)
+	_ = container.CleanupNetwork(c.ID)
 	return state.Unregister(c.ID)
 }
 

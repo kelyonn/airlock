@@ -317,7 +317,7 @@ func CreateVethPair(containerPID int, containerIP, containerID string) error {
 	if err != nil {
 		return fmt.Errorf("open netlink handle in container netns: %w", err)
 	}
-	defer nsLink.Delete()
+	defer nsLink.Close()
 
 	// peerLink was looked up in OUR namespace before the move; look it up
 	// again through the namespace-scoped handle to get a Link value valid
