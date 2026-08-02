@@ -64,6 +64,9 @@ airlock run -p 8080:80 nginx:alpine /docker-entrypoint.sh nginx -g "daemon off;"
 
 # Legacy mode: run a command using the built-in Alpine mini-rootfs
 airlock run /bin/sh
+# Interactive shells like this get a distinct prompt (🔒 airlock
+# <hostname>:<cwd>#) and terminal tab title, so it's obvious at a glance
+# which shell — host or container — a command is about to run in.
 
 # Mount volumes (read-write or read-only)
 airlock run -v /host/path:/container/path /bin/sh

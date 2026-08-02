@@ -267,7 +267,13 @@ func Run(config Config) error {
 		readyR, readyW = nil, nil
 	}
 
-	cmd := reexecCommand(config, containerRootfs, containerIP, readyR != nil)
+	// Checked here, before cmd.Stdout below gets wrapped in an
+	// io.MultiWriter for `airlock logs` — that wrapping is what forces the
+	// re-exec'd child to see a plain pipe as its own stdout regardless of
+	// whether this session is genuinely interactive, so this process's own
+	// fd 1 (still untouched at this point) is the only place left that can
+	// answer the question. See shell_appearance.go.
+	cmd := reexecCommand(config, containerRootfs, containerIP, readyR != nil, StdoutIsTerminal())
 	if readyR != nil {
 		cmd.ExtraFiles = []*os.File{readyR}
 	}
@@ -447,8 +453,8 @@ func Run(config Config) error {
 // Arg order: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON,
 //
 //	noSeccomp, containerIP, noNetwork, envJSON, verbose, workingDir, user,
-//	userNS, command, [cmdArgs...]
-func reexecCommand(config Config, rootfsDir, containerIP string, hasReadyPipe bool) *exec.Cmd {
+//	userNS, readyPipe, initFlag, stdoutIsTerminal, command, [cmdArgs...]
+func reexecCommand(config Config, rootfsDir, containerIP string, hasReadyPipe bool, stdoutIsTerminal bool) *exec.Cmd {
 	volumesJSON, _ := json.Marshal(config.Volumes)
 	envJSON, _ := json.Marshal(config.Env)
 	noSeccomp := "false"
@@ -475,6 +481,10 @@ func reexecCommand(config Config, rootfsDir, containerIP string, hasReadyPipe bo
 	if config.Init {
 		initFlag = "true"
 	}
+	stdoutTerm := "false"
+	if stdoutIsTerminal {
+		stdoutTerm = "true"
+	}
 
 	args := []string{
 		"child",
@@ -493,6 +503,7 @@ func reexecCommand(config Config, rootfsDir, containerIP string, hasReadyPipe bo
 		userNS,
 		readyPipe,
 		initFlag,
+		stdoutTerm,
 		config.Command,
 	}
 	args = append(args, config.Args...)

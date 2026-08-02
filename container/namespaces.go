@@ -18,9 +18,9 @@ import (
 // Args: rootfsDir, hostname, memoryLimit, cpuLimit, volumesJSON,
 //
 //	noSeccomp, containerIP, noNetwork, envJSON, verbose, workingDir, user,
-//	userNS, readyPipe, initFlag, command, [command args...]
+//	userNS, readyPipe, initFlag, stdoutIsTerminal, command, [command args...]
 func Child(args []string) error {
-	if len(args) < 16 {
+	if len(args) < 17 {
 		return fmt.Errorf("insufficient arguments for child process")
 	}
 
@@ -57,8 +57,17 @@ func Child(args []string) error {
 	hasReadyPipe := args[13] == "true"
 	initFlag := args[14] == "true"
 
-	command := args[15]
-	cmdArgs := args[16:]
+	// Whether the ORIGINAL os.Stdout — the parent's, before Run() wraps it
+	// in an io.MultiWriter for `airlock logs` — is a real terminal. Can't
+	// be recomputed from inside this process: by the time Child() runs,
+	// this process's own stdout is always the write end of a pipe (that's
+	// what MultiWriter requires os/exec to set up), regardless of whether
+	// the session is genuinely interactive. See announceContainerShell's
+	// doc comment for what this actually gates.
+	stdoutIsTerminal := args[15] == "true"
+
+	command := args[16]
+	cmdArgs := args[17:]
 
 	// Step 1: Set hostname
 	if err := syscall.Sethostname([]byte(hostname)); err != nil {
@@ -228,8 +237,15 @@ func Child(args []string) error {
 		fmt.Sprintf("HOME=%s", home),
 		"TERM=xterm-256color",
 		fmt.Sprintf("HOSTNAME=%s", hostname),
+		fmt.Sprintf("PS1=%s", containerPS1(hostname)),
 	}
 	env = append(env, extraEnv...)
+
+	// Purely cosmetic, so it happens right before the command actually
+	// takes over the terminal rather than earlier in setup: distinguishing
+	// this session from the host's only matters for however long the
+	// session itself runs.
+	announceContainerShell(hostname, stdoutIsTerminal)
 
 	// initFlag (--init) chooses between two real, different trade-offs —
 	// the exact same choice `docker run` vs `docker run --init` offers,
