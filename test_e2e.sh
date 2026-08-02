@@ -122,9 +122,15 @@ rm -rf "$TMPDIR_TEST"
 header "PHASE 3: Resource Limits (cgroups v2)"
 # ─────────────────────────────────────────────
 
-# 3.1 cgroup is applied and visible
+# 3.1 cgroup is applied and visible (or gracefully skipped where the host
+# doesn't delegate a child cgroup — e.g. airlock itself running inside a
+# Docker container, as CI's e2e job and the local dev sandbox both do)
 out=$(airlock run --no-seccomp --memory 64m /bin/sh -c "cat /proc/self/cgroup" 2>&1) || true
-assert_contains "cgroup entry is visible inside container" "airlock" "$out"
+if echo "$out" | grep -q "could not create a delegated child cgroup"; then
+  skip "cgroup entry is visible inside container (no delegated cgroup available in this environment)"
+else
+  assert_contains "cgroup entry is visible inside container" "airlock" "$out"
+fi
 
 # 3.2 Container runs with CPU limit
 out=$(airlock run --no-seccomp --cpu 25 /bin/sh -c "echo cpu_ok" 2>&1) || true
