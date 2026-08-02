@@ -3,6 +3,7 @@
 package container
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,17 +65,68 @@ func SetupOverlay(lowerDir, instanceID string) (mergedDir string, cleanup func()
 	}
 
 	cleanup = func() {
-		// MNT_DETACH: lazy-unmount: if the merged dir is still momentarily
-		// busy (e.g. a straggler process), this still detaches it from the
-		// namespace immediately and finishes unmounting once it's no
-		// longer referenced, rather than making cleanup fail outright.
-		if err := syscall.Unmount(mergedDir, syscall.MNT_DETACH); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: unmount overlay %s: %v\n", mergedDir, err)
-		}
+		unmountStack(mergedDir)
 		if err := os.RemoveAll(instanceDir); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: remove overlay instance dir %s: %v\n", instanceDir, err)
 		}
 	}
 
 	return mergedDir, cleanup, nil
+}
+
+// unmountStack unmounts every mount currently stacked at path, not just the
+// topmost one.
+//
+// One unmount is not enough, because more than one mount can sit at the same
+// path. Under --userns in particular, Run mounts the overlay here and then
+// bind-mounts the result onto itself (bindRootfsToSelf, a pivot_root
+// prerequisite that has to happen parent-side — see Run's Step 1.6), leaving
+// two stacked mounts at this exact path. Unmounting once left the other one
+// behind permanently: it kept the instance directory busy, so the RemoveAll
+// that follows failed with ENOTEMPTY, and the mount itself stayed in the
+// HOST mount namespace — airlock's parent process does this mounting as real
+// root in the initial namespace, so nothing tears it down when the container
+// exits. Confirmed by hand before the fix: three --userns runs left three
+// overlay entries in /proc/mounts, and they never went away.
+//
+// A plain unmount is tried first so the directory is genuinely gone before
+// RemoveAll runs; MNT_DETACH is the fallback for the case where something
+// still holds the mount (a straggler process), which detaches it from the
+// namespace immediately and completes once the last reference goes away.
+// The loop stops as soon as the path isn't a mount point (EINVAL), so it
+// only ever removes mounts that were actually stacked here, and is bounded
+// regardless so a surprising mount table can't spin it forever.
+func unmountStack(path string) {
+	const maxStacked = 16
+	for range maxStacked {
+		err := syscall.Unmount(path, 0)
+		if err == nil {
+			continue // another mount may be stacked underneath this one
+		}
+		if errors.Is(err, syscall.EINVAL) {
+			return // not a mount point any more: the stack is fully cleared
+		}
+
+		// Busy. In practice this is the normal case for the topmost mount
+		// here, not an exceptional one — the bind and the overlay beneath
+		// it reference each other, so a plain unmount of the top reports
+		// EBUSY even with the container long gone.
+		//
+		// MNT_DETACH removes it from the mount tree immediately (only the
+		// final teardown is deferred until the last reference drops), which
+		// exposes whatever was stacked underneath — so keep looping rather
+		// than returning here. Returning was the original bug: it detached
+		// exactly one mount, left the one below it mounted and therefore
+		// still full of the image's files, and the RemoveAll that follows
+		// then failed with ENOTEMPTY while the mount stayed behind for good.
+		derr := syscall.Unmount(path, syscall.MNT_DETACH)
+		if derr == nil {
+			continue
+		}
+		if errors.Is(derr, syscall.EINVAL) {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "warning: unmount overlay %s: %v\n", path, derr)
+		return
+	}
 }

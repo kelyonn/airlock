@@ -15,16 +15,6 @@ import (
 	"github.com/kelyonn/airlock/state"
 )
 
-// userNSHostIDOffset / userNSIDRangeSize define the host UID/GID range a
-// --userns container's own 0-65535 range is mapped onto. 100000 is the
-// same convention most distros' subuid/subgid defaults and other container
-// tools use, chosen simply to stay clear of real system accounts (which
-// end well before 100000 on virtually every distro).
-const (
-	userNSHostIDOffset = 100000
-	userNSIDRangeSize  = 65536
-)
-
 // Run creates and runs a new container with the given configuration.
 // It re-executes the current binary with a special "child" argument
 // so that the child process runs inside the new namespaces.
@@ -98,11 +88,13 @@ func Run(config Config) error {
 	// again), but not fatal.
 	containerRootfs := rootfsDir
 	overlayCleanup := func() {}
+	rootfsIsPrivate := false
 	if mergedDir, cleanup, overlayErr := SetupOverlay(rootfsDir, state.GenerateID()); overlayErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: overlay setup failed, falling back to the shared image rootfs directly (concurrent containers from this image may conflict): %v\n", overlayErr)
 	} else {
 		containerRootfs = mergedDir
 		overlayCleanup = cleanup
+		rootfsIsPrivate = true
 	}
 	// Runs on every return path from here on, success or error, so a
 	// failure partway through setup (a bad volume spec, cmd.Start()
@@ -114,7 +106,7 @@ func Run(config Config) error {
 	// by this process while it was still real root, so it's owned by
 	// uid/gid 0 with normal 0755/0644 permissions — no write access for
 	// anyone else. Once CLONE_NEWUSER/the ID mapping takes effect, the
-	// child is host uid userNSHostIDOffset, not real root, and would fail
+	// child is host uid usernsBase, not real root, and would fail
 	// on the very first mkdir/mount it tries against that tree
 	// (bindRootfsToSelf, then pivot_root's own working directory).
 	// Chowning the tree to the mapped range fixes that; it has to happen
@@ -122,13 +114,44 @@ func Run(config Config) error {
 	// itself no longer has the privilege to chown anything once it's
 	// running as the mapped uid.
 	//
-	// Every --userns container currently maps to the same fixed range (see
-	// userNSHostIDOffset), so this is safe to reapply on every run: it's
-	// idempotent, and a later NON-userns run of the same image is
-	// unaffected (real root bypasses DAC checks regardless of file
-	// ownership).
+	// Which range this container gets depends on whether its rootfs is
+	// actually its own. With overlayfs active (the normal case)
+	// containerRootfs is a merged view whose writes — including this chown,
+	// which overlayfs services by copying the affected entries up into this
+	// container's private upperdir — are invisible to every other
+	// container, so each one can safely own a DISTINCT range. That's what
+	// makes two --userns containers isolated from each other by UID and not
+	// merely from the host.
+	//
+	// Without overlayfs, containerRootfs IS the shared image cache, the same
+	// directory every other container from that image is using. Handing out
+	// distinct ranges there would be actively worse than sharing one: the
+	// second container to start would re-chown the first's running rootfs to
+	// a UID the first can no longer write as. So that path stays on the
+	// single shared range, and says so.
+	usernsBase := 0
 	if config.UserNS {
-		if err := chownForUserNS(containerRootfs); err != nil {
+		usernsBase = userNSBaseForIndex(userNSSharedIndex)
+		if rootfsIsPrivate {
+			base, allocErr := allocateUserNSRange()
+			if allocErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not allocate a private UID range (%v) — falling back to the shared range %d, which does not isolate this container from other --userns containers by UID\n", allocErr, usernsBase)
+			} else {
+				usernsBase = base
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "warning: rootfs is shared (no overlayfs), so this container uses the shared UID range %d — it is isolated from the host, but not from other --userns containers\n", usernsBase)
+		}
+
+		if Verbose {
+			fmt.Printf("[container] --userns: container uid/gid 0-%d → host %d-%d\n",
+				userNSIDRangeSize-1, usernsBase, usernsBase+userNSIDRangeSize-1)
+		}
+
+		// Safe to (re)apply on every run: a later NON-userns run of the same
+		// image is unaffected, since real root bypasses DAC checks
+		// regardless of file ownership.
+		if err := chownForUserNS(containerRootfs, usernsBase); err != nil {
 			return fmt.Errorf("prepare rootfs ownership for --userns: %w", err)
 		}
 		// Owning the rootfs tree outright still isn't sufficient to reach
@@ -286,13 +309,14 @@ func Run(config Config) error {
 
 	if config.UserNS {
 		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUSER
-		// Map the container's entire UID/GID range (0-65535) to an
-		// unprivileged block starting at userNSHostIDOffset on the host.
-		// Container UID 0 becomes host UID userNSHostIDOffset — a process
-		// that's root *inside* the namespace is just an arbitrary
-		// unprivileged UID from the host's point of view, with none of
-		// real root's access to host files, other processes, or devices
-		// outside what that UID already owns.
+		// Map the container's entire UID/GID range (0-65535) to the
+		// unprivileged block starting at usernsBase on the host (allocated
+		// above — private to this container whenever its rootfs is).
+		// Container UID 0 becomes host UID usernsBase — a process that's
+		// root *inside* the namespace is just an arbitrary unprivileged UID
+		// from the host's point of view, with none of real root's access to
+		// host files, other processes, or devices outside what that UID
+		// already owns.
 		//
 		// This requires airlock's own process (the one calling Start) to
 		// hold CAP_SETUID/CAP_SETGID over the mapped range — true when
@@ -301,7 +325,7 @@ func Run(config Config) error {
 		// that, the kernel would require the /etc/subuid delegation dance
 		// rootless tools like rootlesskit use instead; airlock doesn't
 		// support that path.
-		idMap := []syscall.SysProcIDMap{{ContainerID: 0, HostID: userNSHostIDOffset, Size: userNSIDRangeSize}}
+		idMap := []syscall.SysProcIDMap{{ContainerID: 0, HostID: usernsBase, Size: userNSIDRangeSize}}
 		cmd.SysProcAttr.UidMappings = idMap
 		cmd.SysProcAttr.GidMappings = idMap
 		// Without this, setgroups(2) is denied inside the new user
@@ -316,7 +340,7 @@ func Run(config Config) error {
 		// namespace boundary from here on. The airlock parent process
 		// calling Start() is real host root (kuid 0 in the initial
 		// namespace), and kuid 0 isn't covered by the map above (which
-		// only covers the range starting at userNSHostIDOffset) — left
+		// only covers the range starting at usernsBase) — left
 		// alone, the child would keep that same real-root kuid, which is
 		// unmapped from inside its own new namespace and therefore reports
 		// as the kernel's overflow uid (65534, "nobody") with NO
@@ -326,7 +350,7 @@ func Run(config Config) error {
 		// Setting Credential here makes Go call setuid(0)/setgid(0) as
 		// part of the fork/exec sequence, AFTER uid_map/gid_map are
 		// written — namespace-relative, so this targets container-uid 0,
-		// which the map resolves to host uid userNSHostIDOffset. That's
+		// which the map resolves to host uid usernsBase. That's
 		// what actually makes the process "become" mapped-root: its real
 		// kuid changes to the mapped value, which the kernel then
 		// recognizes as namespace-uid 0 for every future capability check,
@@ -355,7 +379,7 @@ func Run(config Config) error {
 	// among all running processes, preventing veth name collisions when many
 	// containers start in rapid succession (e.g. compose stacks).
 	containerID := fmt.Sprintf("%d", cmd.Process.Pid)
-	state.Register(containerID, cmd.Process.Pid, config.Command, containerRootfs, "", containerIP, config.Image, config.ServiceName, config.ComposeFile)
+	state.Register(containerID, cmd.Process.Pid, config.Command, containerRootfs, "", containerIP, config.Image, config.ServiceName, config.ComposeFile, usernsBase)
 
 	if logFile != nil {
 		if finalPath, err := ContainerLogPath(containerID); err == nil {

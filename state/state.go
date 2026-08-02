@@ -24,6 +24,13 @@ type Container struct {
 	Image       string `json:"image"`                  // OCI image reference (empty if using default Alpine rootfs)
 	ServiceName string `json:"service_name,omitempty"` // for compose
 	ComposeFile string `json:"compose_file,omitempty"` // for compose
+	// UserNSBase is the first host UID/GID of the range this container's
+	// user namespace maps onto, or 0 for a container running without
+	// --userns. It's recorded here because that's what makes the range
+	// reclaimable: allocation cross-checks live containers rather than
+	// trusting a standalone counter, so unregistering a container is what
+	// frees its range (see container.allocateUserNSRange).
+	UserNSBase int `json:"userns_base,omitempty"`
 }
 
 // stateFilePath returns the path to the containers state file.
@@ -113,7 +120,7 @@ func List() ([]Container, error) {
 // ipAddress is the allocated container IP (e.g. "10.0.42.2") or empty string if
 // networking is disabled. image is the OCI image reference or empty string if using
 // the default Alpine rootfs. serviceName and composeFile are used for compose stacks.
-func Register(id string, pid int, command string, rootfsDir string, cgroupDir string, ipAddress string, image string, serviceName string, composeFile string) error {
+func Register(id string, pid int, command string, rootfsDir string, cgroupDir string, ipAddress string, image string, serviceName string, composeFile string, userNSBase int) error {
 	return withLock(func(path string) error {
 		containers := loadUnlocked(path)
 
@@ -128,6 +135,7 @@ func Register(id string, pid int, command string, rootfsDir string, cgroupDir st
 			Image:       image,
 			ServiceName: serviceName,
 			ComposeFile: composeFile,
+			UserNSBase:  userNSBase,
 		}
 
 		containers = append(containers, c)
