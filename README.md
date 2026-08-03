@@ -50,6 +50,78 @@ The host process and the container's PID-1 process are the *same binary*, re-exe
 
 ---
 
+### What this is for
+
+Airlock isn't meant to replace Docker, and it shouldn't be pointed at anything you actually depend on — see "Security model & limitations" below for exactly where it falls short of that. What it's for is demonstrating, concretely and by hand, an understanding of what a container runtime is actually doing underneath `docker run`: namespaces, cgroups, seccomp, overlayfs, netlink, the OCI registry protocol. That's a different and more specific claim than "knows the `docker` CLI," and it's meant to be legible as such — a portfolio/interview artifact, not a tool.
+
+The debugging notes below aren't incidental — they're arguably the more interesting half of the project. Building the features means following documentation; hitting (and correctly diagnosing) things like the `mount()` superblock-ownership rule for user namespaces, or PID 1's kernel-enforced habit of silently dropping any signal it hasn't explicitly handled, means reasoning about a real system from its actual behavior. Each entry in "Debugging notes" is a small case study in that: an assumption that seemed reasonable, a symptom that didn't match it, and a fix grounded in the kernel semantics rather than a workaround.
+
+### Guided Demo Walkthrough
+
+A suggested order for showing this off, front-loading the most convincing evidence first. `--no-seccomp` appears in the early, throwaway examples purely because seccomp deadlocks under Docker Desktop's single-vCPU `linuxkit` VM (see "Debugging notes"); it's on by default and demonstrated for real in Act 4.
+
+**Act 1 — real isolation, not just a chroot with extra steps**
+```bash
+airlock run --no-seccomp alpine:3.20 sh -c 'echo pid=$$; hostname; cat /etc/os-release'
+```
+PID 1, its own hostname, its own filesystem — all from one process, no VM.
+
+**Act 2 — the real OCI/Docker Hub registry protocol**
+```bash
+airlock run --no-seccomp nginx:alpine
+```
+No hardcoded rootfs: this resolves a multi-arch manifest list for your platform, verifies every layer blob's SHA-256 against the digest the registry claimed, and falls back to the image's own `ENTRYPOINT`/`CMD` with no command given.
+
+**Act 3 — networking over raw netlink, not `ip`/`nsenter` shell-outs**
+```bash
+airlock run --no-seccomp -p 8080:80 nginx:alpine &
+curl localhost:8080
+```
+A container with its own bridged IP, reachable through a real DNAT port-forward, built on `AF_NETLINK` sockets — the same underlying mechanism containerd itself uses. Verified end-to-end from genuinely external traffic (curling the machine airlock runs on from a *different* one — real client IP, correctly logged by the container). `curl localhost:PORT` from the exact same machine specifically (hairpin/loopback NAT — the same `net.ipv4.conf.*.route_localnet` mechanism Docker's own bridge driver relies on for this case) is implemented the same way Docker does it, but wasn't reproducible for verification inside this project's own triple-nested dev sandbox (Docker Desktop's `linuxkit` VM, running the dev container, running airlock's own namespaces) — plausibly one more `linuxkit`-specific quirk alongside the seccomp deadlock and the overlay-on-overlay refusal already documented, though this one wasn't tracked down as conclusively. Worth confirming on real Linux before leaning on it.
+
+**Act 4 — the security story, and the best single demo beat in the project**
+
+Needs real Linux (bare metal or a cloud VM), not the Docker Desktop dev sandbox below — Docker Desktop's `linuxkit` VM is exactly where airlock deliberately *skips* installing seccomp at all, to dodge a kernel deadlock (see "Debugging notes"), so this specific contrast won't show up there.
+
+```bash
+# seccomp specifically, isolated from capability-dropping: mknod stays
+# CAP_MKNOD-allowed in airlock's capability bounding set either way, so
+# only seccomp's own syscall filter decides the outcome here — mount
+# would be a worse example, since CAP_SYS_ADMIN is already stripped from
+# that bounding set regardless of seccomp, and would fail either way.
+airlock run alpine:3.20 sh -c 'mknod /tmp/d c 1 3 && echo created'              # denied
+airlock run --no-seccomp alpine:3.20 sh -c 'mknod /tmp/d c 1 3 && echo created'  # created, for contrast
+
+# user namespaces: root inside, an unprivileged UID outside — same
+# process, two vantage points
+airlock run --userns alpine:3.20 sleep 30 &
+sleep 2
+CID=$(airlock ps | tail -1 | awk '{print $1}')
+grep Uid: /proc/"$CID"/status   # host UID — not root, e.g. 165536
+airlock exec "$CID" id          # uid=0(root) — same process, different namespace
+```
+That last pair is worth pausing on: it's the entire point of user namespaces made visible in ten seconds, and it's this project's own code doing the UID mapping and the per-container range allocation (see "Security model & limitations"), not something borrowed from a library.
+
+**Act 5 — multi-container orchestration**
+```bash
+airlock compose up
+```
+Dependency-ordered startup (`db` before `app`), pre-allocated IPs, and working service-name DNS between containers from a stack file — not single-container-only.
+
+**Act 6 — lifecycle parity with `docker`'s own UX**
+```bash
+airlock run --init redis:alpine &
+sleep 2
+CID=$(airlock ps | tail -1 | awk '{print $1}')
+airlock exec "$CID" redis-cli ping
+airlock logs "$CID"
+airlock stop "$CID"
+```
+
+One thing worth saying out loud during Act 4 or 6, since it's the kind of nuance that reads as more senior than skipping it: `--init` is an explicit opt-in, not the default, because without it the container's command genuinely *is* PID 1 — which some tooling depends on — at the cost of the kernel silently dropping any signal it hasn't installed a handler for. `airlock stop` still works either way (it escalates to `SIGKILL` after a timeout), just not always gracefully without `--init`. See "Debugging notes" for how that was actually found: a background shell loop that ran straight through `Ctrl+C`.
+
+---
+
 ### Usage: Running Containers
 
 ```bash
@@ -222,6 +294,8 @@ Airlock demonstrates the primitives; it does not claim production-grade isolatio
 **Concurrent containers sharing one filesystem.** `image.Pull` caches an image's extracted rootfs once, at a single path keyed by image reference. Early on, every container run from that image `pivot_root`ed directly into that same shared directory — two containers from the same image running concurrently (two replicas in a compose stack, or just two overlapping `airlock run` calls) would see and corrupt each other's writes to it. Fixed by giving each container its own overlayfs view: the shared cache stays a read-only lowerdir, and every container gets a fresh, private upperdir for its own writes (`container/overlay.go`). Falls back to the old shared-directory behavior if overlayfs itself isn't available (e.g. testing airlock inside a Docker container whose own root is already overlayfs — stacking overlay-on-overlay is restricted on many kernels; a bare-metal or cloud VM host doesn't hit this). A related bug hit the *pull* itself: two containers pulling the same *currently-uncached* image at the same moment both saw an empty cache and both extracted into it concurrently — reproduced as a "text file busy" mid-extraction and, separately, a container segfaulting on first exec. Fixed with a per-image `flock` around the whole cache-check-through-extract sequence (`internal/filelock`), so a second pull of the same image blocks until the first finishes rather than racing it; verified with four concurrent pulls of the same uncached image.
 
 **Replacing `ip`/`iptables`/`nsenter` shell-outs with netlink.** The original network setup shelled out to four separate binaries per container start, trusting exit codes and parsing nothing. Bridge/veth/address/route setup is now done over a direct `AF_NETLINK` socket (`github.com/vishvananda/netlink`) — including configuring the container's own `eth0`, loopback, and default route from the *host* side via a netlink handle bound to the container's network namespace (`netlink.NewHandleAt`), instead of `nsenter`-ing in to run `ip` commands. That also incidentally removed the eth0 setup race this README used to describe here: the interface is fully configured, synchronously, as part of veth creation, before the container's own init code ever gets a chance to look for it — no more retry loop guessing whether the parent has "gotten to it yet". iptables rules (MASQUERADE, DNAT, FORWARD) still go through the `iptables` binary via `github.com/coreos/go-iptables` — there's no mature pure-Go netfilter/iptables implementation to swap in without a much larger nftables rewrite — so that one dependency remains, down from four.
+
+**Published ports didn't work from the same machine airlock runs on.** Found while re-verifying `-p`/`--publish` for this README's demo section, not from a bug report: `airlock run -p 8080:80 nginx:alpine` followed by `curl localhost:8080` on the *same* host timed out, while curling that same container from a genuinely separate machine worked fine. The cause: `SetupPortForward` only ever added a `PREROUTING` DNAT rule, which exists to catch packets *arriving* on a real interface — a locally-generated packet (`curl` running on the very machine doing the forwarding) never passes through `PREROUTING` at all, since it originates already past that point, in `OUTPUT`. Fixed by adding a matching `OUTPUT`-chain DNAT rule, plus `net.ipv4.conf.{all,lo,airlock0}.route_localnet=1` — without it, the kernel still refuses to route a loopback-*sourced* packet out a real interface as a martian packet, regardless of what DNAT already rewrote the destination to; writing only `net.ipv4.conf.all.route_localnet` turned out not to be enough on its own, confirmed by hand — it seeds the default for interfaces created *afterward*, not a live check against ones (like `lo`) that already existed. This is the identical mechanism Docker's own bridge driver uses for the same reason. Verified the core mechanism end-to-end — curling the container from a genuinely different machine, with the real client IP correctly logged on the container side — but couldn't get the loopback-specific case reproducible for a clean pass/fail inside this project's own dev sandbox (Docker Desktop's `linuxkit` VM, running the dev container, running airlock's own namespaces — three network-namespace layers deep), despite the fix being applied and its rules confirmed installed and matched via iptables' own packet counters. Plausibly one more `linuxkit`-specific quirk alongside the seccomp deadlock and the overlay-on-overlay refusal already documented above, but unlike those two, this one wasn't tracked down to a conclusive root cause — flagged here rather than claimed as fixed without reservation.
 
 **A mount leak hiding behind a "directory not empty" warning.** Giving each `--userns` container its own UID range (above) meant exercising the overlay teardown path properly for the first time — the dev sandbox runs airlock inside Docker, where overlay-on-overlay is refused, so the fallback had been masking it. Every `--userns` run was leaving an overlay mount in the **host** mount namespace permanently, and printing only a `remove overlay instance dir ...: directory not empty` warning about the leftover directory it also couldn't delete. The cause was two mounts stacked at the same path: `SetupOverlay` mounts the overlay at `merged`, then `bindRootfsToSelf` bind-mounts that onto itself as a `pivot_root` prerequisite (parent-side, for the superblock reason described above) — and cleanup unmounted exactly once. Worse, the first unmount reports `EBUSY` rather than succeeding, so the code fell to its `MNT_DETACH` path and returned, having removed one mount and left the one underneath still mounted and still full of the image's files, which is what the `RemoveAll` then tripped over. Since airlock's parent does this mounting as real root in the initial namespace, nothing tore it down when the container exited: three runs left three permanent entries in `/proc/mounts`. Fixed by looping the unmount until the path reports `EINVAL` ("not a mount point"), continuing after a lazy detach instead of returning. Verified by running 11 containers across `--userns`, volume, and plain configurations and confirming `/proc/mounts` and `~/.airlock/containers` both end exactly where they started.
 

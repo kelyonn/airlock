@@ -103,6 +103,33 @@ func SetupBridge() error {
 		return fmt.Errorf("enable ip_forward: %w", err)
 	}
 
+	// route_localnet: without it, SetupPortForward's OUTPUT-chain DNAT rule
+	// rewrites a locally-generated packet's destination from
+	// 127.0.0.1:hostPort to the container's real bridge address, but the
+	// kernel still drops it afterward — routing a loopback-SOURCED packet
+	// out any real interface is normally refused outright as a martian
+	// packet, regardless of what DNAT already rewrote the destination to.
+	// This is the same sysctl Docker's own bridge driver sets, for the same
+	// reason: it's what makes `curl localhost:PORT` reach a published
+	// container port work at all, rather than only working for connections
+	// that actually arrive from a real network interface.
+	//
+	// Writing "all" alone isn't enough, confirmed by hand: it only seeds
+	// the DEFAULT applied to interfaces created AFTER the write, not a live
+	// OR/AND against ones that already exist — "lo" (this packet's
+	// originating interface) stayed 0 even with "all" at 1, and the
+	// connection kept failing. The interfaces that are actually consulted
+	// are "lo" (loopback-sourced packets are evaluated against it) and this
+	// bridge (the post-DNAT route lookup for the container's address
+	// resolves to going out here) — both are set explicitly rather than
+	// relying on "all" to cover them.
+	for _, iface := range []string{"all", "lo", bridgeName} {
+		path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/route_localnet", iface)
+		if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
+			return fmt.Errorf("enable route_localnet on %s: %w", iface, err)
+		}
+	}
+
 	ipt, err := iptables.New()
 	if err != nil {
 		return fmt.Errorf("init iptables: %w", err)
@@ -378,6 +405,21 @@ func SetupPortForward(hostPort, containerIP, containerPort string) error {
 	if err := ipt.AppendUnique("nat", "PREROUTING",
 		"-p", "tcp", "--dport", hostPort, "-j", "DNAT", "--to-destination", dest); err != nil {
 		return fmt.Errorf("add DNAT rule for port %s→%s: %w", hostPort, dest, err)
+	}
+	// PREROUTING alone only catches packets ARRIVING on a real interface —
+	// it's the wrong chain for `curl localhost:hostPort` run on the same
+	// host airlock itself is running on, since a locally-generated packet
+	// never passes through PREROUTING at all; it originates already past
+	// that point, in OUTPUT. Without this, the single most obvious way
+	// anyone would try a freshly published port — from the very machine
+	// that published it — silently fails to connect, while the exact same
+	// port forward works fine from any other machine. Needs
+	// route_localnet enabled (see SetupBridge) for the loopback-sourced
+	// case specifically, or the kernel drops the packet after DNAT
+	// rewrites it anyway.
+	if err := ipt.AppendUnique("nat", "OUTPUT",
+		"-p", "tcp", "--dport", hostPort, "-j", "DNAT", "--to-destination", dest); err != nil {
+		return fmt.Errorf("add OUTPUT DNAT rule for port %s→%s: %w", hostPort, dest, err)
 	}
 	if err := ipt.AppendUnique("filter", "FORWARD",
 		"-p", "tcp", "-d", containerIP, "--dport", containerPort, "-j", "ACCEPT"); err != nil {
