@@ -71,8 +71,24 @@ jobs:
         run: go build -o /dev/null ./...
 
   e2e:
-    name: end-to-end (privileged Docker)
-    runs-on: ubuntu-latest
+    name: end-to-end (${{ matrix.arch }})
+    # Both architectures actually RUN the suite, not just compile for it.
+    # amd64-only coverage was a real gap: this project's single worst bug to
+    # date (a hardcoded x86_64 AUDIT_ARCH value in the seccomp filter, which
+    # made the architecture check fail on every syscall and killed every
+    # container instantly on arm64) is precisely the class of failure that
+    # compiles perfectly and only shows up when executed on the other
+    # architecture. The seccomp allow-list has a separate syscall table per
+    # arch for the same reason, so it carries the same risk.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
