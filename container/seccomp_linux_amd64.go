@@ -15,7 +15,7 @@ const auditArch = uint32(0xc000003e)
 
 // allowedSyscalls is the set of syscalls permitted inside airlock containers
 // on x86_64 — everything else the kernel exposes is denied (EPERM) by
-// buildFilter's default branch. 272 entries, derived from Docker's
+// buildFilter's default branch. 270 entries, derived from Docker's
 // own default seccomp profile (moby/moby's daemon/pkg/oci/fixtures/default.json,
 // the same reference containerd, CRI-O, and most other OCI runtimes converge
 // on), not independently hand-picked — this project's own prior seccomp
@@ -40,16 +40,17 @@ const auditArch = uint32(0xc000003e)
 //     own --cap-add/--cap-drop-aware daemon does, because airlock's
 //     capability set never varies between containers.
 //   - clone and personality are gated in Docker's profile on specific
-//     argument VALUES (e.g. which clone(2) flags are set), which needs
-//     actual per-argument BPF comparison instructions (loading the syscall's
-//     argument words from seccomp_data, not just its number) — a genuinely
-//     separate, larger piece of BPF assembly than the flat number-matching
-//     buildFilter already does. Deliberately out of scope here: both are
-//     allowed unconditionally instead, a real, stated simplification rather
-//     than a silent one. This is also not optional in practice — clone
-//     specifically is what fork() and every thread creation ultimately
-//     lowers to, so some allowance for it is load-bearing for basically any
-//     real program, not a nice-to-have.
+//     argument VALUES rather than just the syscall number, so they are
+//     deliberately absent from this flat list: buildFilter emits real
+//     per-argument BPF comparison blocks for them instead (see
+//     cloneFilterBlock and personalityFilterBlock in seccomp.go), matching
+//     Docker's own conditions. clone is allowed only when it isn't creating
+//     a new namespace, which matters most for CLONE_NEWUSER — the one
+//     namespace an unprivileged process can create without CAP_SYS_ADMIN,
+//     and the usual first step of a container escape. Blanket-allowing
+//     clone isn't an option either way: it's what fork() and every thread
+//     creation lower to, so some allowance is load-bearing for any real
+//     program.
 //   - mknod and mknodat are DELIBERATELY excluded even though Docker's own
 //     profile allows them unconditionally — airlock already made this call
 //     before this file existed (see the capability comment in
@@ -77,7 +78,6 @@ var allowedSyscalls = []uint32{
 	unix.SYS_CLOCK_GETRES,
 	unix.SYS_CLOCK_GETTIME,
 	unix.SYS_CLOCK_NANOSLEEP,
-	unix.SYS_CLONE,
 	unix.SYS_CLOSE,
 	unix.SYS_CONNECT,
 	unix.SYS_COPY_FILE_RANGE,
@@ -206,7 +206,6 @@ var allowedSyscalls = []uint32{
 	unix.SYS_OPEN,
 	unix.SYS_OPENAT,
 	unix.SYS_PAUSE,
-	unix.SYS_PERSONALITY,
 	unix.SYS_PIPE,
 	unix.SYS_PIPE2,
 	unix.SYS_POLL,
@@ -350,7 +349,10 @@ func ApplySeccomp() error {
 		return nil
 	}
 
-	filter := buildFilter(auditArch, allowedSyscalls)
+	filter := buildFilter(auditArch, allowedSyscalls, argFilteredSyscalls{
+		clone:       unix.SYS_CLONE,
+		personality: unix.SYS_PERSONALITY,
+	})
 	if err := installFilter(filter); err != nil {
 		return err
 	}

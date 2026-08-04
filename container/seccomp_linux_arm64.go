@@ -24,9 +24,9 @@ const auditArch = uint32(0xc00000b7)
 // same name — see its doc comment for where this comes from (Docker's own
 // default seccomp profile) and the three deliberate deviations from it
 // (capability-gated syscalls resolved against airlock's own fixed
-// capability set; clone/personality allowed unconditionally rather than
-// with true per-argument BPF matching; mknod/mknodat kept excluded on
-// purpose). 232 entries here versus the amd64 file's larger count —
+// capability set; clone/personality absent here because buildFilter matches
+// them with real per-argument BPF blocks instead; mknod/mknodat kept
+// excluded on purpose). 230 entries here versus the amd64 file's larger count —
 // smaller not because arm64 containers need less, but because arm64's
 // syscall ABI is deliberately narrower than x86_64's: it never carried
 // forward amd64's 32-bit-compat syscall numbers, and it dropped most of the
@@ -48,7 +48,6 @@ var allowedSyscalls = []uint32{
 	unix.SYS_CLOCK_GETRES,
 	unix.SYS_CLOCK_GETTIME,
 	unix.SYS_CLOCK_NANOSLEEP,
-	unix.SYS_CLONE,
 	unix.SYS_CLOSE,
 	unix.SYS_CONNECT,
 	unix.SYS_COPY_FILE_RANGE,
@@ -157,7 +156,6 @@ var allowedSyscalls = []uint32{
 	unix.SYS_NANOSLEEP,
 	unix.SYS_NEWFSTATAT,
 	unix.SYS_OPENAT,
-	unix.SYS_PERSONALITY,
 	unix.SYS_PIPE2,
 	unix.SYS_PPOLL,
 	unix.SYS_PRCTL,
@@ -279,7 +277,10 @@ func ApplySeccomp() error {
 		return nil
 	}
 
-	filter := buildFilter(auditArch, allowedSyscalls)
+	filter := buildFilter(auditArch, allowedSyscalls, argFilteredSyscalls{
+		clone:       unix.SYS_CLONE,
+		personality: unix.SYS_PERSONALITY,
+	})
 	if err := installFilter(filter); err != nil {
 		return err
 	}
