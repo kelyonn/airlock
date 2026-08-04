@@ -142,6 +142,28 @@ func SetupBridge() error {
 		"-s", networkSubnet, "!", "-o", bridgeName, "-j", "MASQUERADE"); err != nil {
 		return fmt.Errorf("add MASQUERADE rule: %w", err)
 	}
+	// Second MASQUERADE rule, for the opposite direction of traffic from the
+	// one above: hairpin/loopback-published-port connections (`curl
+	// localhost:hostPort` on the same machine airlock runs on — see
+	// SetupPortForward's OUTPUT-chain DNAT rule and this function's
+	// route_localnet writes above, both prerequisites for this traffic to
+	// even reach this point at all). Getting the packet TO the container
+	// isn't sufficient by itself: DNAT only ever rewrites the destination,
+	// so without this, the container receives a SYN that still claims
+	// source 127.0.0.1 — a loopback address arriving on its non-loopback
+	// eth0 — which the connection never recovers from even with
+	// route_localnet and rp_filter already out of the way. Confirmed by
+	// hand: adding this rule alone was what took `curl localhost:hostPort`
+	// from silently hanging (0 bytes captured on the bridge at all — the
+	// packet died before transmission) to actually completing. This
+	// rewrites the source to the bridge's own address for exactly that
+	// narrow case — loopback-sourced traffic entering this specific
+	// container subnet — the same recipe Docker's own bridge driver uses
+	// for hairpin NAT.
+	if err := ipt.AppendUnique("nat", "POSTROUTING",
+		"-s", "127.0.0.0/8", "-d", networkSubnet, "-j", "MASQUERADE"); err != nil {
+		return fmt.Errorf("add hairpin MASQUERADE rule: %w", err)
+	}
 	if err := ipt.AppendUnique("filter", "FORWARD", "-i", bridgeName, "-j", "ACCEPT"); err != nil {
 		return fmt.Errorf("add FORWARD (in) rule: %w", err)
 	}
