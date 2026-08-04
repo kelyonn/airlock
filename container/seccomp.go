@@ -63,22 +63,29 @@ func bpfJump(code uint16, k uint32, jt, jf uint8) unix.SockFilter {
 //	[1]  If arch == auditArch: skip [2]; else fall through to [2]
 //	[2]  KILL (wrong architecture — reject unknown arch binaries)
 //	[3]  Load syscall number
-//	[4…] Per-syscall: JEQ blockedNR → EPERM
-//	[N]  Default: ALLOW
-func buildFilter(auditArch uint32, blockedSyscalls []uint32) []unix.SockFilter {
+//	[4…] Per-syscall: JEQ allowedNR → ALLOW
+//	[N]  Default: EPERM
+//
+// An allow-list rather than the deny-list this used to be: default-deny
+// means a syscall airlock's own list is simply missing from — not one
+// anybody deliberately decided to block — fails closed instead of silently
+// through. allowedSyscalls (seccomp_linux_{amd64,arm64}.go) is sized in the
+// hundreds rather than the single digits accordingly; see its own doc
+// comment for where that list actually comes from.
+func buildFilter(auditArch uint32, allowedSyscalls []uint32) []unix.SockFilter {
 	filter := []unix.SockFilter{
 		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataArchOffset),
 		bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, auditArch, 1, 0),
 		bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetKill),
 		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataNrOffset),
 	}
-	for _, nr := range blockedSyscalls {
+	for _, nr := range allowedSyscalls {
 		filter = append(filter,
 			bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, nr, 0, 1),
-			bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetEPERM),
+			bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetAllow),
 		)
 	}
-	filter = append(filter, bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetAllow))
+	filter = append(filter, bpfStmt(unix.BPF_RET|unix.BPF_K, seccompRetEPERM))
 	return filter
 }
 
