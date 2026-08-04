@@ -21,9 +21,10 @@ type Manifest struct {
 
 // Descriptor points to a blob (layer or config) by digest.
 type Descriptor struct {
-	MediaType string `json:"mediaType"`
-	Digest    string `json:"digest"`
-	Size      int64  `json:"size"`
+	MediaType   string            `json:"mediaType"`
+	Digest      string            `json:"digest"`
+	Size        int64             `json:"size"`
+	Annotations map[string]string `json:"annotations,omitempty"` // cosign's signature lives here — see signature.go
 }
 
 // authTokenResponse is the JSON payload returned by the Docker Hub token endpoint.
@@ -86,8 +87,14 @@ func GetAuthToken(ref ImageRef) (string, error) {
 
 // FetchManifest retrieves the image manifest for ref from its registry.
 // token is the Bearer token obtained from GetAuthToken; pass "" if not needed.
-// Both OCI and Docker V2 manifest media types are accepted.
-func FetchManifest(ref ImageRef, token string) (Manifest, error) {
+// Both OCI and Docker V2 manifest media types are accepted. Besides the
+// parsed Manifest, it also returns the digest ("sha256:...") of whatever
+// manifest was ACTUALLY resolved and returned — for a tag-based ref that
+// turned out to be a multi-arch manifest list, that's the platform-specific
+// sub-manifest's own digest, not the list's, since that's what a given pull
+// actually runs and what image signature verification (VerifyCosignSignature,
+// signature.go) needs to check the signed payload against.
+func FetchManifest(ref ImageRef, token string) (Manifest, string, error) {
 	// Determine the tag or digest portion of the URL.
 	tagOrDigest := ref.Tag
 	if ref.Digest != "" {
@@ -98,7 +105,7 @@ func FetchManifest(ref ImageRef, token string) (Manifest, error) {
 
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return Manifest{}, fmt.Errorf("create manifest request: %w", err)
+		return Manifest{}, "", fmt.Errorf("create manifest request: %w", err)
 	}
 
 	// Accept both OCI and Docker Distribution manifest schemas.
@@ -111,28 +118,29 @@ func FetchManifest(ref ImageRef, token string) (Manifest, error) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return Manifest{}, fmt.Errorf("fetch manifest: %w", err)
+		return Manifest{}, "", fmt.Errorf("fetch manifest: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return Manifest{}, fmt.Errorf("fetch manifest returned HTTP %d: %s", resp.StatusCode, string(body))
+		return Manifest{}, "", fmt.Errorf("fetch manifest returned HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	// Read the full body so we can verify it against ref.Digest (when the
 	// caller requested a specific digest) before trusting any of its content.
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return Manifest{}, fmt.Errorf("read manifest body: %w", err)
+		return Manifest{}, "", fmt.Errorf("read manifest body: %w", err)
 	}
+
+	sum := sha256.Sum256(body)
+	gotHex := hex.EncodeToString(sum[:])
 
 	if ref.Digest != "" {
 		wantHex := strings.TrimPrefix(ref.Digest, "sha256:")
-		sum := sha256.Sum256(body)
-		gotHex := hex.EncodeToString(sum[:])
 		if !strings.EqualFold(gotHex, wantHex) {
-			return Manifest{}, fmt.Errorf("manifest digest mismatch: expected sha256:%s, got sha256:%s", wantHex, gotHex)
+			return Manifest{}, "", fmt.Errorf("manifest digest mismatch: expected sha256:%s, got sha256:%s", wantHex, gotHex)
 		}
 	}
 
@@ -145,7 +153,7 @@ func FetchManifest(ref ImageRef, token string) (Manifest, error) {
 	if isManifestList {
 		var ml ManifestList
 		if err := json.Unmarshal(body, &ml); err != nil {
-			return Manifest{}, fmt.Errorf("decode manifest list: %w", err)
+			return Manifest{}, "", fmt.Errorf("decode manifest list: %w", err)
 		}
 
 		// Go's GOARCH strings already match OCI architecture names for the
@@ -175,15 +183,15 @@ func FetchManifest(ref ImageRef, token string) (Manifest, error) {
 			platformRef := ImageRef{Registry: ref.Registry, Repo: ref.Repo, Digest: fallback}
 			return FetchManifest(platformRef, token)
 		}
-		return Manifest{}, fmt.Errorf("no linux platform found in manifest list for %s", ref)
+		return Manifest{}, "", fmt.Errorf("no linux platform found in manifest list for %s", ref)
 	}
 
 	var m Manifest
 	if err := json.Unmarshal(body, &m); err != nil {
-		return Manifest{}, fmt.Errorf("decode manifest: %w", err)
+		return Manifest{}, "", fmt.Errorf("decode manifest: %w", err)
 	}
 
-	return m, nil
+	return m, "sha256:" + gotHex, nil
 }
 
 // FetchBlob retrieves a blob (layer or config) from the registry by digest.

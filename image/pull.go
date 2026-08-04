@@ -39,7 +39,15 @@ import (
 // lock is keyed per-image, so pulls of different images still run in
 // parallel; only two pulls of the identical image serialize, and the
 // second one becomes an instant cache hit once the first finishes.
-func Pull(ref string, verbose bool) (string, ImageConfig, error) {
+// verifyKeyPath, when non-empty, requires the image to have a valid cosign
+// static-key signature from that key (see signature.go) — checked only on
+// an actual network pull (a cache hit skips straight to the already-trusted
+// local rootfs, the same way digest verification already works here; this
+// is about the pull/download trust boundary, not a "reverify on every run"
+// guarantee). Any signature failure — unsigned, wrong key, tampered,
+// signed for a different image — aborts the pull before anything is
+// extracted; pass "" to skip verification entirely (the default).
+func Pull(ref string, verbose bool, verifyKeyPath string) (string, ImageConfig, error) {
 	imgRef := ParseReference(ref)
 
 	lockPath, err := pullLockPath(imgRef)
@@ -51,7 +59,7 @@ func Pull(ref string, verbose bool) (string, ImageConfig, error) {
 	var imgConfig ImageConfig
 	err = filelock.WithLock(lockPath, func() error {
 		var pullErr error
-		rootfsDir, imgConfig, pullErr = pullLocked(imgRef, verbose)
+		rootfsDir, imgConfig, pullErr = pullLocked(imgRef, verbose, verifyKeyPath)
 		return pullErr
 	})
 	if err != nil {
@@ -74,7 +82,7 @@ func pullLockPath(ref ImageRef) (string, error) {
 
 // pullLocked does the actual work described in Pull's doc comment. Callers
 // MUST hold the per-image lock (see Pull).
-func pullLocked(imgRef ImageRef, verbose bool) (string, ImageConfig, error) {
+func pullLocked(imgRef ImageRef, verbose bool, verifyKeyPath string) (string, ImageConfig, error) {
 	// --- Fast-path: already cached ---
 	cached, err := IsCached(imgRef)
 	if err != nil {
@@ -105,9 +113,22 @@ func pullLocked(imgRef ImageRef, verbose bool) (string, ImageConfig, error) {
 	}
 
 	// --- Manifest ---
-	manifest, err := FetchManifest(imgRef, token)
+	manifest, manifestDigest, err := FetchManifest(imgRef, token)
 	if err != nil {
 		return "", ImageConfig{}, fmt.Errorf("fetch manifest: %w", err)
+	}
+
+	// --- Signature verification (opt-in via --verify-key) ---
+	// Deliberately before any layer download: refusing to run an image is
+	// only meaningful if nothing from it has already been extracted onto
+	// disk by the time verification fails.
+	if verifyKeyPath != "" {
+		if err := VerifyCosignSignature(imgRef, manifestDigest, token, verifyKeyPath); err != nil {
+			return "", ImageConfig{}, fmt.Errorf("image signature verification failed: %w", err)
+		}
+		if verbose {
+			fmt.Printf("✓  Signature verified against %s\n", verifyKeyPath)
+		}
 	}
 
 	// --- Image config (ENTRYPOINT/CMD/ENV/WORKDIR/USER) ---

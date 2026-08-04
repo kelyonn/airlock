@@ -115,4 +115,14 @@ type Config struct {
 	// gracefully without this. See namespaces.go's runAsInit for the full
 	// story.
 	Init bool
+	// VerifyKeyPath, when non-empty, requires config.Image to have a valid
+	// cosign static-key signature from the PEM public key at this path
+	// before anything from it is extracted or run — see
+	// image/signature.go for exactly what that does and doesn't cover
+	// (static-key only, not Sigstore's keyless/Fulcio/Rekor flow). Empty
+	// by default: most images on Docker Hub aren't cosign-signed at all,
+	// so this can't be a default-on requirement without breaking pulling
+	// anything unsigned. Ignored when Image is empty (the legacy
+	// bare-command mode has no image to verify).
+	VerifyKeyPath string
 }

@@ -123,7 +123,10 @@ func (o *Orchestrator) startService(name string, svc ServiceDef, myIP string, al
 	// it itself via container.Run's own image.Pull call (an instant cache
 	// hit at that point), the same way it fills in ENTRYPOINT/CMD defaults
 	// for a plain `airlock run` when svc.Command is left unset below.
-	rootfsDir, _, err := image.Pull(svc.Image, verbose)
+	// "" — signature verification (VerifyCosignSignature) is wired up as an
+	// `airlock run` flag (--verify-key) only for now; compose has no
+	// per-service equivalent in its YAML schema yet.
+	rootfsDir, _, err := image.Pull(svc.Image, verbose, "")
 	if err != nil {
 		return fmt.Errorf("pull image %s: %w", svc.Image, err)
 	}

@@ -21,6 +21,7 @@ var (
 	userSpec     string
 	userNS       bool
 	initFlag     bool
+	verifyKey    string
 )
 
 var runCmd = &cobra.Command{
@@ -92,21 +93,22 @@ Examples:
 		}
 
 		config := container.Config{
-			Command:      command,
-			Args:         cmdArgs,
-			Hostname:     hostname,
-			MemoryLimit:  memoryLimit,
-			CPULimit:     cpuLimit,
-			Verbose:      verbose,
-			Volumes:      mounts,
-			NoSeccomp:    noSeccomp,
-			Image:        imageRef,
-			NoNetwork:    noNetwork,
-			PortForwards: pfs,
-			WorkingDir:   workingDir,
-			User:         userSpec,
-			UserNS:       userNS,
-			Init:         initFlag,
+			Command:       command,
+			Args:          cmdArgs,
+			Hostname:      hostname,
+			MemoryLimit:   memoryLimit,
+			CPULimit:      cpuLimit,
+			Verbose:       verbose,
+			Volumes:       mounts,
+			NoSeccomp:     noSeccomp,
+			Image:         imageRef,
+			NoNetwork:     noNetwork,
+			PortForwards:  pfs,
+			WorkingDir:    workingDir,
+			User:          userSpec,
+			UserNS:        userNS,
+			Init:          initFlag,
+			VerifyKeyPath: verifyKey,
 		}
 
 		if err := container.Run(config); err != nil {
@@ -137,6 +139,7 @@ func init() {
 	runCmd.Flags().StringVarP(&userSpec, "user", "u", "", `user to run as, as "uid", "uid:gid", "name", or "name:group" (defaults to the image's own USER, or root)`)
 	runCmd.Flags().BoolVar(&userNS, "userns", false, "isolate with a Linux user namespace: container root maps to an unprivileged host UID instead of real root (see README's Security model section)")
 	runCmd.Flags().BoolVar(&initFlag, "init", false, "run the command under a minimal init that forwards signals and reaps zombies (like `docker run --init`); the command is no longer PID 1")
+	runCmd.Flags().StringVar(&verifyKey, "verify-key", "", "require the image to have a valid cosign static-key signature from this PEM public key (cosign sign --key/verify --key compatible; not Sigstore's keyless flow) before pulling or running it")
 	// Stop flag parsing after the first positional arg (the image or command).
 	// Without this, `airlock run alpine /bin/sh -c "cmd"` would try to parse -c as an airlock flag.
 	runCmd.Flags().SetInterspersed(false)

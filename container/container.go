@@ -31,7 +31,7 @@ func Run(config Config) error {
 	var err error
 	if config.Image != "" {
 		var imgConfig image.ImageConfig
-		rootfsDir, imgConfig, err = image.Pull(config.Image, config.Verbose)
+		rootfsDir, imgConfig, err = image.Pull(config.Image, config.Verbose, config.VerifyKeyPath)
 		if err != nil {
 			return fmt.Errorf("image pull failed: %w", err)
 		}
