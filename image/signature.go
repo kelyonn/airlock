@@ -138,6 +138,40 @@ func VerifyCosignSignature(ref ImageRef, manifestDigest string, token string, pu
 		return fmt.Errorf("parse public key %s: %w", pubKeyPath, err)
 	}
 
+	// Two on-registry formats exist and both are supported, because both
+	// are genuinely in use: the OCI-referrers/DSSE-bundle layout current
+	// cosign writes by default, and the older tag-based "simple signing"
+	// layout from cosign 2.x. They live under different tags
+	// ("sha256-<hex>" and "sha256-<hex>.sig" respectively), so trying one
+	// then the other is unambiguous rather than a guess.
+	//
+	// Modern first, since that's what a current `cosign sign --key`
+	// produces. A failure here isn't returned immediately — an image signed
+	// with the older format has no bundle at all, which is a "not this
+	// format" answer rather than a verification failure — so the legacy
+	// path gets its turn before anything is reported.
+	bundleErr := verifyBundleSignature(ref, manifestDigest, token, pubKey)
+	if bundleErr == nil {
+		return nil
+	}
+
+	legacyErr := verifyLegacySignature(ref, manifestDigest, token, pubKey)
+	if legacyErr == nil {
+		return nil
+	}
+
+	// Neither worked. Both errors are surfaced: which one matters depends
+	// on which format the image was actually signed with, and collapsing
+	// them into one message would routinely hide the relevant half — a
+	// genuine bad-signature failure in one format reads very differently
+	// from "no signature artifact of this kind exists."
+	return fmt.Errorf("no valid signature for %s:\n  bundle format (current cosign): %v\n  legacy tag format (cosign 2.x): %v",
+		ref, bundleErr, legacyErr)
+}
+
+// verifyLegacySignature verifies the older tag-based "simple signing"
+// format — see this file's header comment for its layout.
+func verifyLegacySignature(ref ImageRef, manifestDigest string, token string, pubKey *ecdsa.PublicKey) error {
 	sigTag, err := cosignSignatureTag(manifestDigest)
 	if err != nil {
 		return err
