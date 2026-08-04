@@ -80,4 +80,17 @@ jobs:
         run: docker build -t airlock-dev .
 
       - name: Run E2E suite
-        run: docker run --rm --privileged airlock-dev bash /app/test_e2e.sh
+        # --cgroupns=host: with Docker's own default (--cgroupns=private),
+        # airlock's tryCreateChildCgroup (container/cgroups.go) failed to
+        # delegate the memory/cpu controllers in every environment tested
+        # so far — including here, not just nested dev sandboxes. Root
+        # cause: a private cgroup namespace gives this container a
+        # pre-scoped view of /sys/fs/cgroup rooted at its OWN cgroup, and
+        # nothing had delegated controllers into THAT root's own
+        # subtree_control for it to hand further down. --cgroupns=host
+        # instead gives it the real host cgroup hierarchy directly.
+        # Confirmed locally: this alone turns the "could not create a
+        # delegated child cgroup" skip into the memory limit genuinely
+        # constraining a container (killed well inside a 10s bound under
+        # --memory 16m, instead of running unconstrained the whole time).
+        run: docker run --rm --privileged --cgroupns=host airlock-dev bash /app/test_e2e.sh
