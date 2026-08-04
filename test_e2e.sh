@@ -164,12 +164,19 @@ fi
 header "PHASE 4: Seccomp Filter"
 # ─────────────────────────────────────────────
 
-# 4.1 Container starts normally with seccomp (or auto-skips on linuxkit)
+# 4.1 Container starts normally with seccomp (or auto-skips where seccomp
+# can't be installed). The skip branch matches ApplySeccomp's own exact
+# message rather than a loose "seccomp|linuxkit|warning" pattern: that
+# looser version reported a cheerful "auto-skip detected" for the arm64
+# rootfs bug (an unrelated failure whose output merely happened to contain
+# the word "warning"), turning a real breakage into a passing test. A skip
+# branch that can absorb arbitrary unrelated failures is worse than no skip
+# branch at all.
 out=$(airlock run /bin/sh -c "echo seccomp_test_ok" 2>&1) || true
 if echo "$out" | grep -q "seccomp_test_ok"; then
   pass "seccomp mode: container starts and runs command"
-elif echo "$out" | grep -qi "seccomp\|linuxkit\|warning"; then
-  pass "seccomp auto-skip detected (linuxkit/Docker Desktop environment)"
+elif echo "$out" | grep -q "Seccomp: skipped"; then
+  skip "seccomp mode: container starts and runs command (seccomp unavailable in this environment)"
 else
   fail "seccomp: unexpected result"
   echo "    → output: $out"

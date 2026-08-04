@@ -8,21 +8,70 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
 const (
 	alpineVersion = "3.20.0"
-	alpineURL     = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-" + alpineVersion + "-x86_64.tar.gz"
+	alpineBranch  = "v3.20"
 )
 
+// alpineArch maps GOARCH to the architecture name Alpine's own release
+// paths use. Deliberately a lookup with no default: an unrecognized
+// architecture returns a clear error from alpineRootfsURL rather than
+// silently falling back to x86_64 and downloading a rootfs whose binaries
+// cannot execute on this machine — which is exactly the bug this replaced.
+var alpineArch = map[string]string{
+	"amd64": "x86_64",
+	"arm64": "aarch64",
+}
+
+// alpineRootfsURL returns the Alpine mini-rootfs download URL for the
+// architecture this binary is running on.
+//
+// The URL used to hardcode x86_64 in both the path and the filename. On an
+// arm64 host that silently downloaded an x86_64 rootfs, so every legacy-mode
+// container (`airlock run /bin/sh`, the built-in mini-rootfs path — OCI
+// images were unaffected, since image.Pull resolves a multi-arch manifest
+// list for the running platform correctly) failed the instant it tried to
+// exec a binary of the wrong architecture. It compiled and passed the whole
+// test suite on amd64 the entire time; only actually running the suite on
+// an arm64 machine surfaced it. Same shape as this project's earlier
+// hardcoded-AUDIT_ARCH seccomp bug, and found the same way.
+func alpineRootfsURL() (string, error) {
+	arch, ok := alpineArch[runtime.GOARCH]
+	if !ok {
+		return "", fmt.Errorf("no Alpine mini-rootfs known for architecture %q "+
+			"(supported: amd64, arm64) — use an OCI image reference instead, "+
+			"e.g. `airlock run alpine:3.20 /bin/sh`", runtime.GOARCH)
+	}
+	return fmt.Sprintf(
+		"https://dl-cdn.alpinelinux.org/alpine/%s/releases/%s/alpine-minirootfs-%s-%s.tar.gz",
+		alpineBranch, arch, alpineVersion, arch,
+	), nil
+}
+
 // CacheDir returns the path to the cached rootfs directory.
+//
+// Keyed by architecture ("alpine-amd64", "alpine-arm64") rather than a
+// single shared "alpine". Two reasons, one of them a genuine upgrade-path
+// bug: a machine that ran the previous version of this code on arm64 has a
+// fully-extracted *x86_64* rootfs sitting at the old shared path complete
+// with a valid .airlock-extracted marker, so Ensure would take the cache-hit
+// branch and keep handing back the same unusable rootfs even after the URL
+// itself was fixed. A distinct path per architecture sidesteps that with no
+// migration or invalidation logic — the corrected architecture simply has no
+// cache entry yet — and, incidentally, also makes a $HOME shared across
+// architectures (NFS and the like) behave correctly. `airlock clean` removes
+// the whole ~/.airlock/rootfs tree, so stale entries under the old path
+// still get cleaned up by it.
 func CacheDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot determine home directory: %w", err)
 	}
-	return filepath.Join(home, ".airlock", "rootfs", "alpine"), nil
+	return filepath.Join(home, ".airlock", "rootfs", "alpine-"+runtime.GOARCH), nil
 }
 
 // Ensure downloads and extracts the Alpine rootfs if not already cached.
@@ -42,7 +91,15 @@ func Ensure(verbose bool) (string, error) {
 		return cacheDir, nil
 	}
 
-	fmt.Println("⬇  Downloading Alpine Linux rootfs...")
+	// Resolved before anything is created or downloaded, so an unsupported
+	// architecture fails immediately with an actionable message instead of
+	// part-way through setup.
+	url, err := alpineRootfsURL()
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Printf("⬇  Downloading Alpine Linux rootfs (%s)...\n", runtime.GOARCH)
 
 	// Create cache directory
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
@@ -50,7 +107,7 @@ func Ensure(verbose bool) (string, error) {
 	}
 
 	// Download the tarball
-	resp, err := http.Get(alpineURL)
+	resp, err := http.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("download failed: %w", err)
 	}
