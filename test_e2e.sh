@@ -136,6 +136,30 @@ fi
 out=$(airlock run --no-seccomp --cpu 25 /bin/sh -c "echo cpu_ok" 2>&1) || true
 assert_contains "runs with --cpu 25" "cpu_ok" "$out"
 
+# 3.3 Memory limit actually enforces, not just "the container starts under
+# one." An exponentially-doubling string has no way to terminate on its
+# own — if the process exits at all, the cgroup's OOM killer intervened.
+# `timeout` is a safety net here, not the expected trigger: if the limit
+# genuinely isn't enforcing, this loop keeps growing for the full 10s
+# instead of being killed early, which is exactly the failure mode worth
+# catching (and bounding), not something to assert an exact exit code for —
+# Go's ExitCode() reports -1 for a signal death, not the shell's 128+signal
+# convention, so pinning a specific number here would be a flaky, overfit
+# test.
+timeout 10 airlock run --no-seccomp --memory 16m alpine:3.20 sh -c \
+  'x=x; while true; do x="$x$x"; done' >/tmp/oom-test.log 2>&1
+oom_exit=$?
+oom_out=$(cat /tmp/oom-test.log)
+if echo "$oom_out" | grep -q "could not create a delegated child cgroup"; then
+  skip "memory limit is actually enforced (no delegated cgroup available in this environment)"
+elif [ "$oom_exit" -eq 124 ]; then
+  fail "memory limit is actually enforced (process ran the full 10s timeout without being killed)"
+elif [ "$oom_exit" -ne 0 ]; then
+  pass "memory limit is actually enforced (killed under --memory 16m, exit $oom_exit)"
+else
+  fail "memory limit is actually enforced (process exited 0 — should be impossible for an infinite loop)"
+fi
+
 # ─────────────────────────────────────────────
 header "PHASE 4: Seccomp Filter"
 # ─────────────────────────────────────────────
@@ -154,6 +178,26 @@ fi
 # 4.2 --no-seccomp flag works
 out=$(airlock run --no-seccomp /bin/sh -c "echo no_seccomp_ok" 2>&1) || true
 assert_contains "--no-seccomp: container runs" "no_seccomp_ok" "$out"
+
+# 4.3 Seccomp actually blocks a syscall, not just "the container starts."
+# mknod is deliberately chosen over something like mount: CAP_MKNOD stays in
+# airlock's capability bounding set either way (see container/container.go's
+# capability allowlist), so toggling seccomp alone is what flips the
+# outcome here — mount would fail under BOTH runs, since CAP_SYS_ADMIN is
+# already stripped regardless of seccomp, proving nothing about seccomp
+# specifically.
+out=$(airlock run alpine:3.20 sh -c 'mknod /tmp/d c 1 3 && echo created' 2>&1) || true
+if echo "$out" | grep -q "Seccomp: skipped"; then
+  skip "seccomp: mknod is blocked by default (seccomp unavailable in this environment)"
+else
+  if echo "$out" | grep -q "created"; then
+    fail "seccomp: mknod should have been blocked by default, but succeeded"
+  else
+    pass "seccomp: mknod is blocked by default"
+  fi
+  out=$(airlock run --no-seccomp alpine:3.20 sh -c 'mknod /tmp/d c 1 3 && echo created' 2>&1) || true
+  assert_contains "seccomp: --no-seccomp allows mknod (CAP_MKNOD is retained either way)" "created" "$out"
+fi
 
 # ─────────────────────────────────────────────
 header "PHASE 5: Container Networking"
@@ -196,6 +240,39 @@ else
     fail "--no-network: eth0 with 10.0.42.x was present when it shouldn't be"
   fi
 fi
+
+# 5.7-5.8 Port publishing (-p/--publish) — previously had zero e2e coverage
+# of any kind, not even the already-working path. A background container
+# serves one canned HTTP response per connection (busybox `nc -l`, restarted
+# in a loop) on 8000, published to host port 18080.
+airlock run --no-seccomp -p 18080:8000 alpine:3.20 sh -c \
+  'while true; do printf "HTTP/1.1 200 OK\r\n\r\nhello-from-container" | nc -l -p 8000; done' \
+  >/tmp/publish-test.log 2>&1 &
+PUBLISH_BG_PID=$!
+sleep 3
+PUBLISH_CID=$(airlock ps 2>/dev/null | tail -1 | awk '{print $1}')
+
+# 5.7 Direct container IP: the PREROUTING/FORWARD path — expected to work in
+# any environment, since it only needs traffic actually arriving on a real
+# interface, not the hairpin/loopback case 5.8 covers.
+PUBLISH_CIP=$(airlock exec "$PUBLISH_CID" sh -c "ip addr show eth0" 2>/dev/null | grep -oE '10\.0\.42\.[0-9]+' | head -1)
+out=$(timeout 3 curl -sS "$PUBLISH_CIP:8000" 2>&1) || true
+assert_contains "publish: container's own bridge IP is reachable" "hello-from-container" "$out"
+
+# 5.8 curl localhost:<hostport> from the SAME machine airlock runs on —
+# hairpin/loopback NAT (OUTPUT-chain DNAT + route_localnet, see
+# container/network.go's SetupPortForward). Implemented the same way
+# Docker's own bridge driver handles this case, but not yet confirmed
+# working in every environment — see README's Act 3 demo notes. A real
+# assert (not skip) here is deliberate: this suite's whole point is
+# surfacing exactly this kind of "claimed but unverified" gap with a real
+# signal instead of assuming a result.
+out=$(timeout 3 curl -sS "localhost:18080" 2>&1) || true
+assert_contains "publish: curl localhost:<hostport> reaches container (hairpin NAT)" "hello-from-container" "$out"
+
+kill "$PUBLISH_BG_PID" 2>/dev/null || true
+wait "$PUBLISH_BG_PID" 2>/dev/null || true
+airlock stop "$PUBLISH_CID" >/dev/null 2>&1 || true
 
 # ─────────────────────────────────────────────
 header "PHASE 6: OCI Image Pull & Run"
